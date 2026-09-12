@@ -70,7 +70,7 @@ on the right side of the pipe, not to `curl`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eric8810/dlook/main/scripts/install.sh \
-  | sudo env VERSION=v0.2.1 INSTALL_DIR=/usr/local/bin bash
+  | sudo env VERSION=v0.3.0 INSTALL_DIR=/usr/local/bin bash
 ```
 
 Windows: download [`dlook-x86_64-pc-windows-msvc.zip`](https://github.com/eric8810/dlook/releases/latest) from Releases and unzip.
@@ -95,7 +95,9 @@ cargo build --release
 | `↑` `↓` | Scroll one line |
 | `Home` / `End` | Go to top / bottom |
 | `Ctrl+C` | Quit (exit 130) |
+| `⌫` / `Alt+←` | Go back to previous file (after link navigation) |
 | Mouse wheel | Scroll up / down |
+| Mouse click | Open local file link (`↗`) in dlook; open external URL via system opener |
 | Mouse drag | Select text (reversed highlight); auto-scrolls at viewport edges |
 | Release mouse | Copy selection to clipboard via **OSC 52** (works over SSH) |
 | `Shift` + click | Extend selection |
@@ -111,6 +113,14 @@ cargo build --release
   nested lists, task lists, rounded-border tables with per-column alignment,
   quotes, strikethrough; inline links render as a blue underlined label + gray URL.
   Fenced code blocks are syntax-highlighted; ` ```mermaid ` blocks render as diagrams.
+- **Local file links** (e.g. `[guide](./docs/guide.md)`): labeled with a `↗` marker;
+  click to open the target inside dlook (mode/highlighting re-detected by extension),
+  `⌫`/`Alt+←` returns to the previous file with scroll position restored.
+  Relative paths resolve against the current file's directory; `%XX` and
+  `<path with spaces>` forms are supported. Bad targets (missing/dir/binary) show
+  a status message instead of navigating.
+- **External links** (`http://` etc.): click to open with the system opener
+  (`xdg-open` / `open` / `start`); anchor links show a hint.
 - **Mermaid** (`.mmd`/`.mermaid`): rendered to truecolor ASCII art via `mermansi`.
 - **Code / text**: token-level truecolor highlighting via `syntect` with the
   **two-face** full syntax set; long lines are truncated (`less -S` style).
@@ -139,6 +149,11 @@ cargo build --release
 - **Selection** (`rs/src/selection.rs`): mouse drag builds a selection in
   *content coordinates* (stable across scrolling); the viewport renders
   selected spans reversed; releasing copies the text via OSC 52.
+- **Link navigation** (`rs/src/links.rs`): local-file links carry a
+  `LinkSpan` (content coordinates, like selection); a click hit-tests the
+  span, resolves the path against the current file's directory and swaps the
+  `Doc` in place; a history stack powers `⌫` back. External links are handed
+  to the system opener.
 - **Packaging**: `cargo build --release` with size-focused profile
   (`opt-level=z`, fat LTO, strip, `panic=abort`). CI builds per-target
   binaries on tag push and attaches them to the GitHub Release.
@@ -147,15 +162,16 @@ cargo build --release
 rs/src/
   main.rs       entry: argv + binary detection + mode dispatch
   args.rs       argv parsing + --help/--version
-  content.rs    file reading + binary detection + hot reload
+  content.rs    file reading + binary detection + hot reload + navigate reads
   lang.rs       extension → mode + syntax token mapping
+  links.rs      link span model + target classification/path resolution
   highlight.rs  syntect (two-face) highlighter
-  markdown.rs   termimad rendering + task checkboxes + link styling + table frame
+  markdown.rs   termimad rendering + task checkboxes + link styling/spans + table frame
   mermaid.rs    mermaid → truecolor ASCII art (mermansi)
   selection.rs  text selection model (content coords, highlight, copy text)
-  doc.rs        Doc.lines + scroll math
+  doc.rs        Doc.lines/links + scroll math
   viewport.rs   scroll viewport + selection highlight
-  termio.rs     crossterm setup + event loop + keys/wheel/mouse-drag + resize
+  termio.rs     crossterm setup + event loop + keys/wheel/click-links + resize + link navigation
   ansi_lines.rs ANSI → ratatui lines
 ```
 
@@ -165,8 +181,8 @@ Three layers, all green:
 
 | Suite | Command | Coverage |
 |---|---|---|
-| Unit (Rust) | `cd rs && cargo test` | link scanner, task checkboxes, table framing, selection model |
-| E2E (pty + pyte) | `BIN=rs/target/release/dlook python3 test/e2e/run_acceptance.py` | 96 checks: rendering, scrolling, resize, exit codes, non-TTY, markdown styling, selection, language coverage (A–L) |
+| Unit (Rust) | `cd rs && cargo test` | link scanner/classifier, link spans, task checkboxes, table framing, selection model |
+| E2E (pty + pyte) | `BIN=rs/target/release/dlook python3 test/e2e/run_acceptance.py` | 115 checks: rendering, scrolling, resize, exit codes, non-TTY, markdown styling, selection, language coverage, link navigation/click/back/external-opener (A–M) |
 | E2E (tmux, real terminal) | `BIN=rs/target/release/dlook bash test/e2e/run-tmux.sh` | 33 checks: incl. **OSC 52 clipboard content** verification, mouse injection, resize, exit codes (T1–T29) |
 
 ## Documentation
