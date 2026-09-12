@@ -5,6 +5,7 @@ preview
 sea-prep.blob
 *.log
 __pycache__/
+.venv/
 dlook
 test/fixtures/bad.mmd
 docs/mascot-flat.png
