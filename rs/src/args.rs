@@ -8,7 +8,8 @@
 use std::io::Write;
 use std::process::exit;
 
-pub const VERSION: &str = "dlook 0.2.1";
+/// 版本号从 Cargo.toml 派生（单一来源，避免与 crate version 脱节）。
+pub const VERSION: &str = concat!("dlook ", env!("CARGO_PKG_VERSION"));
 
 pub const HELP: &str = "\
 dlook — a minimal terminal file previewer
