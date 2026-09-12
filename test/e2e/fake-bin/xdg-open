@@ -1,0 +1,3 @@
+#!/bin/sh
+# e2e 假 xdg-open:把收到的 URL 记录到 $XDG_LOG,验证外部链接的参数传递。
+printf '%s\n' "$1" > "$XDG_LOG"

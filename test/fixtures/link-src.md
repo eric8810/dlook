@@ -1,0 +1,56 @@
+# Link Source
+
+Local: [dst](link-dst.md) target here.
+
+Missing: [gone](no-such-file.md) target.
+
+Web: [site](https://example.com/dlook) target.
+
+| table | cols |
+|-------|------|
+| [cell](link-dst.md) | b |
+
+```text
+[fenced](link-dst.md)
+```
+
+FILLER-00
+FILLER-01
+FILLER-02
+FILLER-03
+FILLER-04
+FILLER-05
+FILLER-06
+FILLER-07
+FILLER-08
+FILLER-09
+FILLER-10
+FILLER-11
+FILLER-12
+FILLER-13
+FILLER-14
+FILLER-15
+FILLER-16
+FILLER-17
+FILLER-18
+FILLER-19
+FILLER-20
+FILLER-21
+FILLER-22
+FILLER-23
+FILLER-24
+FILLER-25
+FILLER-26
+FILLER-27
+FILLER-28
+FILLER-29
+FILLER-30
+FILLER-31
+FILLER-32
+FILLER-33
+FILLER-34
+FILLER-35
+FILLER-36
+FILLER-37
+FILLER-38
+FILLER-39

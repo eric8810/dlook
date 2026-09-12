@@ -13,6 +13,7 @@ mod content;
 mod doc;
 mod highlight;
 mod lang;
+mod links;
 mod markdown;
 mod mermaid;
 mod selection;

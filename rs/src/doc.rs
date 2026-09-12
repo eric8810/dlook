@@ -3,10 +3,13 @@
 use ratatui::text::Line;
 
 use crate::lang::Mode;
+use crate::links::LinkSpan;
 
 pub struct Doc {
     /// 整篇文档渲染后的带样式行（已按当前宽度换行/截断）。
     pub lines: Vec<Line<'static>>,
+    /// 行内链接的可点击区域（内容坐标，随 lines 一起重建）。
+    pub links: Vec<LinkSpan>,
     /// 滚动位置（视口首行在 lines 中的索引）。
     pub top: usize,
     /// 预览模式（保留用于模式感知的重排决策）。
@@ -17,9 +20,15 @@ pub struct Doc {
 }
 
 impl Doc {
-    pub fn new(lines: Vec<Line<'static>>, mode: Mode, width: u16) -> Self {
+    pub fn new(
+        lines: Vec<Line<'static>>,
+        mode: Mode,
+        width: u16,
+        links: Vec<LinkSpan>,
+    ) -> Self {
         Self {
             lines,
+            links,
             top: 0,
             mode,
             width,
@@ -44,8 +53,15 @@ impl Doc {
 
     /// 按新宽度重排（md 换行 / code 截断 / mermaid 重渲）。
     /// 由 main.rs 在 resize 时调用，传入重新生成的 lines。
-    pub fn replace_lines(&mut self, lines: Vec<Line<'static>>, width: u16, body_h: usize) {
+    pub fn replace_lines(
+        &mut self,
+        lines: Vec<Line<'static>>,
+        links: Vec<LinkSpan>,
+        width: u16,
+        body_h: usize,
+    ) {
         self.lines = lines;
+        self.links = links;
         self.width = width;
         self.set_top(self.top, body_h);
     }

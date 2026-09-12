@@ -17,17 +17,19 @@ use termimad::{FmtText, MadSkin};
 
 use crate::ansi_lines;
 use crate::highlight::Highlighter;
+use crate::links::{self, LinkSpan};
 use crate::mermaid;
 
-/// 将 markdown 源码渲染为 ratatui Vec<Line>。
+/// 将 markdown 源码渲染为 ratatui Vec<Line>,同时收集行内链接的可点击区域。
 pub fn markdown_to_lines(
     md: &str,
     width: u16,
     skin: &MadSkin,
     hl: &Highlighter,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<LinkSpan>) {
     let segments = split_at_fences(md);
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut links: Vec<LinkSpan> = Vec::new();
 
     for seg in segments {
         match seg {
@@ -36,15 +38,22 @@ pub fn markdown_to_lines(
                 let text = render_task_checkboxes(&text);
                 let ansi = render_prose_to_ansi(&text, width, skin);
                 let lines = ansi_lines::to_lines(&ansi, width);
-                // 行内链接样式化 + 表格圆角外框(仅 prose)
-                out.extend(frame_tables(style_links(lines)));
+                // 先补表格圆角外框(会插入行),再做链接样式化——
+                // 这样 LinkSpan.line 基于最终行集,表格后移的链接行号正确。
+                let base = out.len();
+                let (styled, mut seg_links) = style_links(frame_tables(lines));
+                for l in &mut seg_links {
+                    l.line += base;
+                }
+                out.extend(styled);
+                links.append(&mut seg_links);
             }
             Segment::Code { lang, code } => {
                 out.extend(render_code_fence(&code, lang.as_deref(), width, hl));
             }
         }
     }
-    out
+    (out, links)
 }
 
 /// 一个文档段：prose 或 code block。
@@ -291,26 +300,45 @@ fn link_url_style() -> Style {
     Style::default().fg(LINK_URL_FG)
 }
 
-/// 对渲染后的行做行内链接样式化:
-/// `[label](url)` → `label`(亮蓝+下划线)+ `" (url)"`(暗灰)。
+/// 对渲染后的行做行内链接样式化 + 收集可点击区域:
+/// `[label](url)` → `label`(亮蓝+下划线)+ `" (url)"`(暗灰);
+/// 本地文件链接(label 无 scheme/非锚点)额外加 `↗` 标记,可点击区域
+/// 覆盖 label 与 `(url)` 后缀(整段渲染结果,与浏览器一致)。
 /// 仅处理无样式的 span(行内代码/加粗等已有样式的片段跳过),
 /// 且要求整个链接落在同一个 span 内(termimad 对未识别语法的输出即如此)。
-fn style_links(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    lines
+fn style_links(lines: Vec<Line<'static>>) -> (Vec<Line<'static>>, Vec<LinkSpan>) {
+    let mut all_links: Vec<LinkSpan> = Vec::new();
+    let lines = lines
         .into_iter()
-        .map(|line| {
-            if line.spans.iter().any(|s| is_plain(s.style) && contains_link(&s.content)) {
-                let spans: Vec<Span<'static>> = line
-                    .spans
-                    .into_iter()
-                    .flat_map(style_span_links)
-                    .collect();
+        .enumerate()
+        .map(|(li, line)| {
+            if line
+                .spans
+                .iter()
+                .any(|s| is_plain(s.style) && contains_link(&s.content))
+            {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                let mut col = 0usize; // 已产出的字符列(行内)
+                for span in line.spans {
+                    let (sub, sub_links) = style_span_links(span);
+                    for (s0, s1, target) in sub_links {
+                        all_links.push(LinkSpan {
+                            line: li,
+                            start: col + s0,
+                            end: col + s1,
+                            target,
+                        });
+                    }
+                    col += sub.iter().map(|s| s.content.chars().count()).sum::<usize>();
+                    spans.extend(sub);
+                }
                 Line::default().spans(spans).style(line.style)
             } else {
                 line
             }
         })
-        .collect()
+        .collect();
+    (lines, all_links)
 }
 
 /// span 无有效前景/背景/修饰样式。
@@ -323,19 +351,38 @@ fn is_plain(style: Style) -> bool {
     fg_plain && bg_plain && uc_plain && style.add_modifier.is_empty()
 }
 
-fn style_span_links(span: Span<'static>) -> Vec<Span<'static>> {
+/// 展开一个 span 内的所有链接。
+/// 返回 (新 span 列表, 链接区域列表);区域坐标相对 span 产出的首字符。
+fn style_span_links(span: Span<'static>) -> (Vec<Span<'static>>, Vec<(usize, usize, String)>) {
     if !is_plain(span.style) || !contains_link(&span.content) {
-        return vec![span];
+        return (vec![span], Vec::new());
     }
     let s: &str = &span.content;
     let mut out: Vec<Span<'static>> = Vec::new();
-    let mut pos = 0usize;
+    let mut hits: Vec<(usize, usize, String)> = Vec::new();
+    let mut pos = 0usize; // 原文本扫描位置
+    let mut col = 0usize; // 产出文本当前列
     while let Some((start, label, url, end)) = find_link(s, pos) {
         if start > pos {
-            out.push(Span::raw(s[pos..start].to_string()));
+            let lead = s[pos..start].to_string();
+            col += lead.chars().count();
+            out.push(Span::raw(lead));
         }
-        out.push(Span::styled(label.to_string(), link_label_style()));
-        out.push(Span::styled(format!(" ({})", url), link_url_style()));
+        // 本地文件链接加 ↗ 标记(D14)
+        let label_text = if links::is_local_target(url) {
+            format!("{label}↗")
+        } else {
+            label.to_string()
+        };
+        let url_text = format!(" ({url})");
+        let l_start = col;
+        let label_len = label_text.chars().count();
+        let url_len = url_text.chars().count();
+        out.push(Span::styled(label_text, link_label_style()));
+        col += label_len;
+        out.push(Span::styled(url_text, link_url_style()));
+        col += url_len;
+        hits.push((l_start, col, url.to_string()));
         pos = end;
     }
     if pos < s.len() {
@@ -344,7 +391,7 @@ fn style_span_links(span: Span<'static>) -> Vec<Span<'static>> {
     if out.is_empty() {
         out.push(span);
     }
-    out
+    (out, hits)
 }
 
 fn contains_link(s: &str) -> bool {
@@ -456,7 +503,8 @@ fn border_line(rule_text: &str, style: Style, top: bool) -> Option<Line<'static>
 
 /// 在 `s[from..]` 查找行内链接 `[label](url)`,
 /// 返回 `(匹配起点, label, url, 匹配终点)`。
-/// 语法(简化):label 不含未转义 `[`/`]`;url 不含空白与 `)`;忽略图片 `![...]`。
+/// 语法(简化):label 不含未转义 `[`/`]`;url 两种形式——
+/// 裸形式(不含空白与 `)`)或 `<>` 包裹(允许空白,CommonMark 风格);忽略图片 `![...]`。
 fn find_link(s: &str, from: usize) -> Option<(usize, &str, &str, usize)> {
     let b = s.as_bytes();
     let mut i = from;
@@ -498,6 +546,23 @@ fn find_link(s: &str, from: usize) -> Option<(usize, &str, &str, usize)> {
             continue;
         }
         let mut k = j + 2;
+        // <> 包裹形式:扫到配对 >,url 为其内文本(允许空白)
+        if k < b.len() && b[k] == b'<' {
+            k += 1;
+            let url_start = k;
+            while k < b.len() && b[k] != b'>' {
+                k += 1;
+            }
+            if k < b.len() && b[k] == b'>' && k + 1 < b.len() && b[k + 1] == b')' && k > url_start
+            {
+                let label = &s[i + 1..j];
+                let url = &s[url_start..k];
+                return Some((i, label, url, k + 2));
+            }
+            i = j + 1;
+            continue;
+        }
+        // 裸形式:不含空白与 )
         while k < b.len() && b[k] != b')' && !b[k].is_ascii_whitespace() {
             if b[k] == b'\\' {
                 k += 1;
@@ -551,6 +616,20 @@ mod tests {
         let (_, label, url, _) = find_link("[a [b] c](https://x)", 0).unwrap();
         assert_eq!(label, "a [b] c");
         assert_eq!(url, "https://x");
+    }
+
+    #[test]
+    fn find_link_angle_bracket_url_with_spaces() {
+        let s = "see [doc](<my file.md>) now";
+        let (start, label, url, end) = find_link(s, 0).unwrap();
+        assert_eq!(start, 4);
+        assert_eq!(label, "doc");
+        assert_eq!(url, "my file.md");
+        assert_eq!(&s[end..], " now");
+        // 未闭合 <> → 不匹配
+        assert!(find_link("[a](<unclosed.md)", 0).is_none());
+        // 空 <> → 不匹配
+        assert!(find_link("[a](<>)", 0).is_none());
     }
 
     // ---- 任务列表 checkbox(DECISIONS D6)----
@@ -616,15 +695,23 @@ mod tests {
         );
     }
 
-    // ---- 链接样式化端到端(D3)----
+    // ---- 链接样式化端到端(D3/D14)----
 
     #[test]
     fn style_links_renders_label_and_url() {
         let lines = vec![Line::default().spans(vec![Span::raw(
             "see [docs](https://example.com) end",
         )])];
-        let out = style_links(lines);
+        let (out, links) = style_links(lines);
         assert_eq!(out.len(), 1);
+        // 外部链接也有可点击区域(点击 → 系统打开器),只是不加 ↗ 标记
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "https://example.com");
+        assert_eq!(links[0].start, 4);
+        assert_eq!(
+            links[0].end,
+            4 + "docs (https://example.com)".chars().count()
+        );
         let spans = &out[0].spans;
         // before / label / (url) / after 四段
         assert_eq!(spans.len(), 4);
@@ -635,5 +722,74 @@ mod tests {
         assert!(spans[1].style.add_modifier.contains(Modifier::UNDERLINED));
         assert_eq!(spans[1].style.fg, Some(RColor::LightBlue));
         assert_eq!(spans[2].style.fg, Some(RColor::DarkGray));
+    }
+
+    #[test]
+    fn style_links_local_gets_marker_and_span() {
+        let lines = vec![Line::default().spans(vec![Span::raw(
+            "see [guide](./guide.md) end",
+        )])];
+        let (out, links) = style_links(lines);
+        assert_eq!(links.len(), 1);
+        let l = &links[0];
+        assert_eq!(l.target, "./guide.md");
+        assert_eq!(l.start, 4); // "see " 之后
+        // 可点击区域覆盖 label↗ + " (./guide.md)"
+        assert_eq!(l.end, 4 + "guide↗ (./guide.md)".chars().count());
+        let text: String = out[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "see guide↗ (./guide.md) end");
+    }
+
+    #[test]
+    fn style_links_multiple_and_position_offset() {
+        // 第二个链接的列坐标要加上前文产出的字符数
+        let lines = vec![Line::default().spans(vec![Span::raw(
+            "[a](a.md) then [b](b.md)",
+        )])];
+        let (_, links) = style_links(lines);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].start, 0);
+        assert_eq!(links[0].target, "a.md");
+        // "a↗ (a.md) then " 长度后开始
+        let offset = "a↗ (a.md) then ".chars().count();
+        assert_eq!(links[1].start, offset);
+        assert_eq!(links[1].target, "b.md");
+    }
+
+    #[test]
+    fn markdown_to_lines_collects_links_across_table_and_fence() {
+        let md = "# T\n\nsee [docs](./sub.md) here\n\n| a | b |\n|---|---|\n| [cell](c.md) | 2 |\n\nafter [two](x.md)\n\n```text\n[fenced](y.md)\n```\n";
+        let skin = MadSkin::default();
+        let hl = Highlighter::new();
+        let (lines, links) = markdown_to_lines(md, 60, &skin, &hl);
+
+        // prose 链接 3 个(docs/cell/two),code fence 内不算
+        assert_eq!(links.len(), 3);
+        let targets: Vec<&str> = links.iter().map(|l| l.target.as_str()).collect();
+        assert_eq!(targets, vec!["./sub.md", "c.md", "x.md"]);
+
+        // 每个链接的 line 都应指向含对应 label↗ 的渲染行
+        // (表格块会插入圆角边框行,frame_tables 之后 style_links 的行号必须正确)
+        for (l, label) in links.iter().zip(["docs", "cell", "two"]) {
+            let line_text: String = lines[l.line]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert!(
+                line_text.contains(&format!("{label}↗")),
+                "line {} should contain {label}↗, got: {line_text}",
+                l.line
+            );
+        }
+        // fence 行不是链接
+        let fence_line = lines
+            .iter()
+            .position(|ln| {
+                let t: String = ln.spans.iter().map(|s| s.content.as_ref()).collect();
+                t.contains("[fenced](y.md)")
+            })
+            .unwrap();
+        assert!(links.iter().all(|l| l.line != fence_line));
     }
 }

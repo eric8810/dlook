@@ -9,6 +9,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::path::Path;
 use std::process::exit;
 
 use crate::lang::{detect_mode_lang, Mode};
@@ -78,4 +79,28 @@ pub fn reload_content(file_path: &str) -> Option<String> {
         return None; // 二进制文件，跳过
     }
     Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// 点击链接跳转时的读取失败原因（用于状态栏提示）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenError {
+    NotFound,
+    IsDir,
+    Unreadable,
+    Binary,
+}
+
+/// 读取一个本地文件用于导航跳转。
+/// 与 load_content 不同:失败不退出进程,而是返回可提示的错误分类。
+pub fn read_for_navigate(path: &Path) -> Result<String, OpenError> {
+    let meta = fs::metadata(path).map_err(|_| OpenError::NotFound)?;
+    if meta.is_dir() {
+        return Err(OpenError::IsDir);
+    }
+    let bytes = fs::read(path).map_err(|_| OpenError::Unreadable)?;
+    let sample_len = bytes.len().min(BINARY_SAMPLE);
+    if bytes[..sample_len].contains(&0) {
+        return Err(OpenError::Binary);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }

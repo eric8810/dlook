@@ -188,7 +188,7 @@ def scenario_D():
     # clamp to the new last row (footer); the footer reappears on the next render
     # cycle. Trigger a settle render, then assert positioning.
     s.send_key("j"); s.feed(0.15); s.send_key("k"); s.feed(0.2)
-    check("doc-preview" in s.row(1), "D2 header row1 after shrink", s.row(1)[:40])
+    check("sample.ts" in s.row(1), "D2 header row1 after shrink", s.row(1)[:40])
     check("q quit" in s.row(12), "D2 footer at row12 after shrink", s.row(12)[:20])
     check("TypeScript" in s.screen_text(), "D2 body content still present after shrink")
     s.send_key("q"); s.wait_exit(3); s.close()
@@ -467,6 +467,96 @@ def scenario_L():
     s.send_key("q"); s.wait_exit(3); s.close()
 
 
+# --------------------------------------------------------------------------
+# M. 本地文件链接渲染与点击导航(DECISIONS D14)
+# --------------------------------------------------------------------------
+def _find_cell(s, text):
+    """返回 (col, row) 1-based:屏幕上 text 首次出现的列/行;未找到返回 None。"""
+    for r, line in enumerate(s.screen.display, start=1):
+        c = line.find(text)
+        if c >= 0:
+            return c + 1, r
+    return None
+
+
+def _click(s, col, row):
+    """在 (col,row) 注入左键按下+松开(SGR 鼠标序列)。"""
+    s.send(_sgr("M", 0, col, row)); s.feed(0.12)
+    s.send(_sgr("m", 0, col, row)); s.feed(0.35)
+
+
+def scenario_M():
+    print("== M-links ==")
+    import tempfile
+    xdg_log = os.path.join(tempfile.gettempdir(), "dlook-xdg-open.log")
+    if os.path.exists(xdg_log):
+        os.remove(xdg_log)
+    fake_bin = os.path.join(ROOT, "test", "e2e", "fake-bin")
+    env = dict(os.environ,
+               XDG_LOG=xdg_log,
+               PATH=fake_bin + os.pathsep + os.environ["PATH"])
+
+    s = session("link-src.md", env=env)
+    check(s.wait_for("Link Source", 6), "M1 start")
+    check("dst↗" in s.screen_text(), "M1 local link marker ↗")
+    check("(link-dst.md)" in s.screen_text(), "M1 local link url shown")
+    check("site" in s.screen_text(), "M1 external link label shown (no marker)")
+
+    # M2: 滚动两行后点击本地链接 → 内部跳转(滚动位置进历史)
+    s.send_key("j"); s.feed(0.15)
+    s.send_key("j"); s.feed(0.15)
+    before_row = s.row(2)
+    cell = _find_cell(s, "dst↗")
+    check(cell is not None, "M2 find link cell")
+    if cell:
+        _click(s, *cell)
+        check(s.wait_for("LINK-DST-MARKER", 5), "M2 click navigates to target")
+        check("link-dst.md" in s.row(1), "M2 header shows target file")
+        check("back" in s.row(24), "M2 footer shows back hint")
+
+    # M3: Backspace 返回 → 恢复原文件与滚动位置
+    if cell:
+        s.send_key("Backspace"); s.feed(0.4)
+        check("link-src.md" in s.row(1), "M3 backspace returns to source")
+        check(s.row(2) == before_row, "M3 scroll position restored")
+
+    # M4: 缺失链接 → 状态栏提示,不跳转
+    cell = _find_cell(s, "gone↗")
+    if cell:
+        _click(s, *cell)
+        check("not found" in s.screen_text(), "M4 missing link status message")
+        check("link-src.md" in s.row(1), "M4 stays on source")
+
+    # M5: 外部链接 → 假 xdg-open 收到 URL,本页不动
+    cell = _find_cell(s, "site")
+    if cell:
+        _click(s, *cell)
+        s.feed(0.5)
+        got = open(xdg_log).read().strip() if os.path.exists(xdg_log) else ""
+        check(got == "https://example.com/dlook", f"M5 xdg-open got url (got {got!r})")
+        check("link-src.md" in s.row(1), "M5 stays on source after external link")
+        check("opened externally" in s.screen_text(), "M5 status shows opened")
+
+    # M6: 代码块内的伪链接不可点击
+    cell = _find_cell(s, "[fenced]")
+    if cell:
+        header_before = s.row(1)
+        _click(s, *cell)
+        check(s.row(1) == header_before, "M6 fenced pseudo-link not clickable")
+
+    # M7: 表格内链接 → 跳转(验证表格边框行插入后的行号正确)
+    cell = _find_cell(s, "cell↗")
+    if cell:
+        _click(s, *cell)
+        check(s.wait_for("LINK-DST-MARKER", 5), "M7 table link navigates")
+        check("link-dst.md" in s.row(1), "M7 header shows target")
+
+    s.send_key("q")
+    code = s.wait_exit(3)
+    s.close()
+    check(code == 0, "M8 quit 0")
+
+
 def main():
     print(f"BIN = {BIN}")
     print(f"FIX = {FIX}")
@@ -477,7 +567,7 @@ def main():
 
     for sc in [scenario_A, scenario_B, scenario_C, scenario_D,
                scenario_E, scenario_F, scenario_G, scenario_H, scenario_I,
-               scenario_J, scenario_K, scenario_L]:
+               scenario_J, scenario_K, scenario_L, scenario_M]:
         try:
             sc()
         except Exception as ex:
