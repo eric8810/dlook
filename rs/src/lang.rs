@@ -11,6 +11,8 @@ pub enum Mode {
     Markdown,
     Code,
     Mermaid,
+    /// 图片文件(png/jpeg/gif/webp/bmp/ico/tiff,DECISIONS D15)。
+    Image,
 }
 
 /// 扩展名 → syntect token(先按扩展名查,再按 token 查,见 Highlighter::find_syntax)。
@@ -108,6 +110,22 @@ pub fn is_mermaid_ext(file_name: &str) -> bool {
     }
 }
 
+/// 是否为图片扩展名(DECISIONS D15;与 Cargo.toml 里 image crate 启用的解码器一致)。
+pub fn is_image_ext(file_name: &str) -> bool {
+    let base = file_name.rsplit('/').next().unwrap_or(file_name);
+    let lower = base.to_lowercase();
+    match lower.rfind('.') {
+        Some(dot) => {
+            let ext = &lower[dot + 1..];
+            matches!(
+                ext,
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tiff" | "tif"
+            )
+        }
+        None => false,
+    }
+}
+
 /// 判定预览模式 + 语法 token。
 pub fn detect_mode_lang(file_name: &str) -> (Mode, Option<&'static str>) {
     if is_markdown_ext(file_name) {
@@ -115,6 +133,9 @@ pub fn detect_mode_lang(file_name: &str) -> (Mode, Option<&'static str>) {
     }
     if is_mermaid_ext(file_name) {
         return (Mode::Mermaid, None);
+    }
+    if is_image_ext(file_name) {
+        return (Mode::Image, None);
     }
     (Mode::Code, detect_syntax_token(file_name))
 }

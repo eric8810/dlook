@@ -19,6 +19,13 @@ termimad = "0.35"
 minimad = "0.16"
 mermansi = "0.1.6"
 ansi-to-tui = "8.0"
+# 图片渲染(D15):协议探测 + kitty/sixel/iTerm2/halfblocks,滚动视口用 sliced 模块
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
+# 远程图片 http/https 获取(rustls,无 openssl 依赖)
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# data: URL 内联图片解码(ratatui-image 已引入,零额外体积)
+base64-simd = "0.8"
 
 [profile.release]
 opt-level = "z"

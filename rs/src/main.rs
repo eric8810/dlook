@@ -12,6 +12,7 @@ mod args;
 mod content;
 mod doc;
 mod highlight;
+mod images;
 mod lang;
 mod links;
 mod markdown;
@@ -30,6 +31,14 @@ fn main() {
 
     // 非 TTY（管道重定向）：pager 无意义 → 直出
     if !termio::is_tty() {
+        // 图片无法在管道中渲染(图形协议需要 TTY)
+        if loaded.mode == lang::Mode::Image {
+            eprintln!(
+                "error: '{}' is an image file; run dlook in a terminal to view it",
+                parsed.file
+            );
+            exit(1);
+        }
         let stdout = std::io::stdout();
         use std::io::Write;
         let mut lock = stdout.lock();

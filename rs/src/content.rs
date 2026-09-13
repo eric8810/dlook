@@ -45,6 +45,19 @@ pub fn load_content(file_path: &str) -> Loaded {
         fail(&format!("error: '{}' is a directory", file_path));
     }
 
+    let (mode, syntax_token) = detect_mode_lang(file_path);
+
+    // 图片模式(DECISIONS D15):不读文本、不做二进制检测;
+    // 字节由 images::ImageCtx 的加载线程按需读取(直开/热重载共用)。
+    if mode == Mode::Image {
+        return Loaded {
+            file_name: file_path.to_string(),
+            content: String::new(),
+            mode,
+            syntax_token,
+        };
+    }
+
     let bytes = match fs::read(file_path) {
         Ok(b) => b,
         Err(_) => fail(&format!(
@@ -60,7 +73,6 @@ pub fn load_content(file_path: &str) -> Loaded {
     }
 
     let content = String::from_utf8_lossy(&bytes).into_owned();
-    let (mode, syntax_token) = detect_mode_lang(file_path);
 
     Loaded {
         file_name: file_path.to_string(),

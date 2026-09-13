@@ -10,32 +10,45 @@
 //!      - 无 lang         → 纯文本
 
 use std::fmt::Write;
+use std::path::Path;
 
+use ratatui::layout::Size;
 use ratatui::style::{Color as RColor, Modifier, Style};
 use ratatui::text::{Line, Span};
 use termimad::{FmtText, MadSkin};
 
 use crate::ansi_lines;
+use crate::doc::DocImage;
 use crate::highlight::Highlighter;
+use crate::images::{ImageCtx, Render, MAX_IMG_ROWS};
 use crate::links::{self, LinkSpan};
 use crate::mermaid;
 
-/// 将 markdown 源码渲染为 ratatui Vec<Line>,同时收集行内链接的可点击区域。
+/// 将 markdown 源码渲染为 ratatui Vec<Line>,同时收集行内链接与图片放置记录。
+///
+/// 图片(DECISIONS D15):
+///   - 独立段落的 `![alt](src)` → `Segment::Image`,经 `ImageCtx` 走图形协议,
+///     在 lines 里占位 h 行空行(滚动/选区/链接坐标全部照常工作);
+///   - 行内嵌在文字中的图片 → 预处理改写为 `[alt](src)` 普通链接;
+///   - 图片禁用(DLOOK_IMAGE_PROTOCOL=off)或加载失败 → 降级为可点击链接行/错误行。
 pub fn markdown_to_lines(
     md: &str,
     width: u16,
     skin: &MadSkin,
     hl: &Highlighter,
-) -> (Vec<Line<'static>>, Vec<LinkSpan>) {
+    img: Option<&ImageCtx>,
+    base_dir: &Path,
+) -> (Vec<Line<'static>>, Vec<LinkSpan>, Vec<DocImage>) {
     let segments = split_at_fences(md);
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut links: Vec<LinkSpan> = Vec::new();
+    let mut images: Vec<DocImage> = Vec::new();
 
     for seg in segments {
         match seg {
             Segment::Prose(text) => {
-                // 任务列表 checkbox 预处理(仅 prose,代码块内不处理)
-                let text = render_task_checkboxes(&text);
+                // 任务列表 checkbox + 行内图片降级预处理(仅 prose,代码块内不处理)
+                let text = render_task_checkboxes(&rewrite_inline_images(&text));
                 let ansi = render_prose_to_ansi(&text, width, skin);
                 let lines = ansi_lines::to_lines(&ansi, width);
                 // 先补表格圆角外框(会插入行),再做链接样式化——
@@ -51,18 +64,102 @@ pub fn markdown_to_lines(
             Segment::Code { lang, code } => {
                 out.extend(render_code_fence(&code, lang.as_deref(), width, hl));
             }
+            Segment::Image { alt, src } => {
+                render_image_segment(&alt, &src, img, base_dir, width, &mut out, &mut links, &mut images);
+            }
         }
     }
-    (out, links)
+    (out, links, images)
 }
 
-/// 一个文档段：prose 或 code block。
+/// 渲染一个独立段落图片:就绪 → 占位空行 + 放置记录;否则占位提示行。
+#[allow(clippy::too_many_arguments)]
+fn render_image_segment(
+    alt: &str,
+    src: &str,
+    img: Option<&ImageCtx>,
+    base_dir: &Path,
+    width: u16,
+    out: &mut Vec<Line<'static>>,
+    links: &mut Vec<LinkSpan>,
+    images: &mut Vec<DocImage>,
+) {
+    // 图片禁用(显式 off)→ 降级为可点击链接行(点击本地图片文件可在 dlook 内打开)
+    let render = img
+        .filter(|ctx| !ctx.disabled())
+        .map(|ctx| ctx.get_or_load(src, base_dir, Size::new(width, MAX_IMG_ROWS)));
+    match render {
+        Some(Render::Ready(proto)) => {
+            let size = proto.size();
+            let line = out.len();
+            images.push(DocImage {
+                line,
+                proto,
+                h: size.height,
+            });
+            // 占位空行:行数 = 图片行数,滚动/选区/链接坐标照常
+            out.extend(std::iter::repeat(Line::default()).take(size.height as usize));
+        }
+        Some(Render::Loading) => {
+            out.push(Line::default().spans(vec![Span::styled(
+                format!("⏳ loading image … ({src})"),
+                Style::default().add_modifier(Modifier::DIM),
+            )]));
+        }
+        Some(Render::Failed(e)) => {
+            let mut spans = vec![Span::styled(
+                "✗ image unavailable: ",
+                Style::default().fg(RColor::Red).add_modifier(Modifier::DIM),
+            )];
+            spans.push(Span::styled(
+                e.to_string(),
+                Style::default().fg(RColor::Red).add_modifier(Modifier::DIM),
+            ));
+            out.push(Line::default().spans(spans));
+        }
+        None => {
+            // 图片关闭:🖼 alt (src) 样式化链接行
+            let label = if alt.is_empty() {
+                "🖼 image".to_string()
+            } else {
+                format!("🖼 {alt}")
+            };
+            push_image_fallback_link(&label, src, out, links);
+        }
+    }
+}
+
+/// 降级链接行:label 亮蓝下划线 + (src) 暗灰,与 style_links 的观感一致。
+fn push_image_fallback_link(
+    label: &str,
+    src: &str,
+    out: &mut Vec<Line<'static>>,
+    links: &mut Vec<LinkSpan>,
+) {
+    let url_text = format!(" ({src})");
+    let line_idx = out.len();
+    let start = 0usize;
+    let end = label.chars().count() + url_text.chars().count();
+    links.push(LinkSpan {
+        line: line_idx,
+        start,
+        end,
+        target: src.to_string(),
+    });
+    out.push(Line::default().spans(vec![
+        Span::styled(label.to_string(), link_label_style()),
+        Span::styled(url_text, link_url_style()),
+    ]));
+}
+
+/// 一个文档段：prose、code block 或独立段落图片。
 enum Segment {
     Prose(String),
     Code { lang: Option<String>, code: String },
+    Image { alt: String, src: String },
 }
 
-/// 预扫描 markdown，按围栏代码块拆分。
+/// 预扫描 markdown，按围栏代码块与独立段落图片拆分。
 fn split_at_fences(md: &str) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut prose_buf = String::new();
@@ -87,6 +184,13 @@ fn split_at_fences(md: &str) -> Vec<Segment> {
             }
             let lang = info.trim().split_whitespace().next().map(|s| s.to_string());
             segments.push(Segment::Code { lang, code });
+        } else if let Some((alt, src)) = parse_standalone_image(line) {
+            // 独立段落图片(整行就是一个图片引用):自成一段,不经 termimad
+            if !prose_buf.is_empty() {
+                prose_buf.pop();
+                segments.push(Segment::Prose(std::mem::take(&mut prose_buf)));
+            }
+            segments.push(Segment::Image { alt, src });
         } else {
             prose_buf.push_str(line);
             prose_buf.push('\n');
@@ -100,6 +204,159 @@ fn split_at_fences(md: &str) -> Vec<Segment> {
     }
 
     segments
+}
+
+/// 整行(允许 ≤3 空格缩进)恰好是一个 `![alt](src)` 图片引用 → 提取。
+fn parse_standalone_image(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim_start();
+    let indent = line.len() - trimmed.len();
+    if indent > 3 {
+        return None;
+    }
+    let (start, alt, src, end) = find_image(trimmed, 0)?;
+    if start != 0 || end != trimmed.len() {
+        return None; // 行内还有其它内容 → 非独立段落
+    }
+    Some((alt.to_string(), src.to_string()))
+}
+
+/// 在 `s[from..]` 查找行内图片 `![alt](src)`(可选 title),
+/// 返回 `(匹配起点, alt, src, 匹配终点)`。
+/// 语法:alt 支持转义与一层嵌套方括号;url 为裸形式或 `<>` 包裹形式,
+/// 均可带可选 title(`"t"` / `'t'`,须前置空白);仅匹配单行内的完整语法。
+fn find_image(s: &str, from: usize) -> Option<(usize, &str, &str, usize)> {
+    let b = s.as_bytes();
+    let mut i = from;
+    while i + 1 < b.len() {
+        if b[i] != b'!' || b[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        let alt_start = i + 2;
+        // 找配对的 ]
+        let mut j = alt_start;
+        let mut depth = 1usize;
+        while j < b.len() {
+            match b[j] {
+                b'\\' => j += 1,
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        if j >= b.len() || b[j] != b']' {
+            i += 1;
+            continue;
+        }
+        let alt = &s[alt_start..j];
+        // 紧跟 (url)
+        if j + 1 >= b.len() || b[j + 1] != b'(' {
+            i += 1;
+            continue;
+        }
+        let mut k = j + 2;
+        // <> 包裹形式
+        if k < b.len() && b[k] == b'<' {
+            k += 1;
+            let url_start = k;
+            while k < b.len() && b[k] != b'>' {
+                k += 1;
+            }
+            if k < b.len() && b[k] == b'>' && k > url_start {
+                if let Some(end) = after_title(s, k + 1) {
+                    return Some((i, alt, &s[url_start..k], end));
+                }
+            }
+            i += 1;
+            continue;
+        }
+        // 裸形式:扫到首个 ')'(url 不含括号;title 内也没有)
+        let url_start = k;
+        while k < b.len() && b[k] != b')' {
+            if b[k] == b'\\' {
+                k += 1;
+            }
+            k += 1;
+        }
+        if k >= b.len() {
+            i += 1;
+            continue;
+        }
+        let url = strip_title(&s[url_start..k]);
+        if !url.is_empty() {
+            return Some((i, alt, url, k + 1));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// url 部分可能带可选 title(`url "t"` / `url 't'`,title 前须有空白)→ 剥离出纯 url。
+fn strip_title(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    for q in ['"', '\''] {
+        if let Some(qpos) = trimmed.find(q) {
+            if qpos > 0 && trimmed[..qpos].ends_with(char::is_whitespace) {
+                return trimmed[..qpos].trim_end();
+            }
+        }
+    }
+    trimmed
+}
+
+/// `<>` 形式之后:可选空白 + 可选 title + `)` → 返回 `)` 之后的位置。
+fn after_title(s: &str, from: usize) -> Option<usize> {
+    let rest = &s[from..];
+    let lead = rest.len() - rest.trim_start().len();
+    let t = rest.trim_start();
+    for q in ['"', '\''] {
+        if t.starts_with(q) {
+            let inner = &t[1..];
+            let qclose = inner.find(q)?;
+            let after_q = &inner[qclose + 1..];
+            let trail = after_q.len() - after_q.trim_start().len();
+            if after_q.trim_start().starts_with(')') {
+                return Some(from + lead + 1 + qclose + 1 + trail + 1);
+            }
+            return None;
+        }
+    }
+    if t.starts_with(')') {
+        Some(from + lead + 1)
+    } else {
+        None
+    }
+}
+
+/// 行内图片降级(DECISIONS D15):`![alt](src)` → `[alt](src)` 普通链接,
+/// 交给既有链接管线(样式化 + 可点击)。
+/// 独立段落图片已被 split_at_fences 提走,这里处理剩下的行内形式。
+fn rewrite_inline_images(md: &str) -> String {
+    if !md.contains("![") {
+        return md.to_string();
+    }
+    let mut out = String::with_capacity(md.len() + 8);
+    let mut pos = 0usize;
+    while let Some((start, alt, src, end)) = find_image(md, pos) {
+        if start > pos {
+            out.push_str(&md[pos..start]);
+        }
+        // 去掉 '!' → 复用 [label](url) 语法
+        out.push('[');
+        out.push_str(alt);
+        out.push_str("](");
+        out.push_str(src);
+        out.push(')');
+        pos = end;
+    }
+    out.push_str(&md[pos.min(md.len())..]);
+    out
 }
 
 /// 检测围栏开始行，返回 (围栏字符, info 字符串)。
@@ -584,6 +841,7 @@ fn find_link(s: &str, from: usize) -> Option<(usize, &str, &str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::images::ImagePolicy;
 
     // ---- find_link(DECISIONS D3)----
 
@@ -761,7 +1019,8 @@ mod tests {
         let md = "# T\n\nsee [docs](./sub.md) here\n\n| a | b |\n|---|---|\n| [cell](c.md) | 2 |\n\nafter [two](x.md)\n\n```text\n[fenced](y.md)\n```\n";
         let skin = MadSkin::default();
         let hl = Highlighter::new();
-        let (lines, links) = markdown_to_lines(md, 60, &skin, &hl);
+        let (lines, links, images) = markdown_to_lines(md, 60, &skin, &hl, None, Path::new("/"));
+        assert!(images.is_empty());
 
         // prose 链接 3 个(docs/cell/two),code fence 内不算
         assert_eq!(links.len(), 3);
@@ -791,5 +1050,164 @@ mod tests {
             })
             .unwrap();
         assert!(links.iter().all(|l| l.line != fence_line));
+    }
+
+    // ---- 图片分段与行内降级(DECISIONS D15)----
+
+    #[test]
+    fn find_image_basic_forms() {
+        let (start, alt, src, end) = find_image("![logo](img/logo.png)", 0).unwrap();
+        assert_eq!((start, alt, src), (0, "logo", "img/logo.png"));
+        assert_eq!(end, "![logo](img/logo.png)".len());
+
+        // title 形式(bare + angle)
+        let (_, _, src, end) = find_image("![a](path/x.png \"Title\")", 0).unwrap();
+        assert_eq!(src, "path/x.png");
+        assert_eq!(end, "![a](path/x.png \"Title\")".len());
+        let (_, _, src, _) = find_image("![a](<my img.png> 't')", 0).unwrap();
+        assert_eq!(src, "my img.png");
+
+        // 空alt、嵌套括号、转义
+        let (_, alt, src, _) = find_image("![](i.png)", 0).unwrap();
+        assert_eq!((alt, src), ("", "i.png"));
+        let (_, alt, _, _) = find_image("![a [b] c](i.png)", 0).unwrap();
+        assert_eq!(alt, "a [b] c");
+
+        // 非图片/坏语法
+        assert!(find_image("[not image](x.md)", 0).is_none());
+        assert!(find_image("![unclosed](x.png", 0).is_none());
+        assert!(find_image("![a]()", 0).is_none());
+        // 文本中间的图片也能找到(行内降级用)
+        let (start, _, src, _) =
+            find_image("prefix ![i](a.png) suffix", 0).unwrap();
+        assert_eq!(start, 7);
+        assert_eq!(src, "a.png");
+    }
+
+    #[test]
+    fn standalone_image_detection() {
+        assert_eq!(
+            parse_standalone_image("![logo](./logo.png)"),
+            Some(("logo".into(), "./logo.png".into()))
+        );
+        // 缩进 ≤3
+        assert!(parse_standalone_image("  ![a](b.png)").is_some());
+        assert!(parse_standalone_image("    ![a](b.png)").is_none());
+        // 行内有其它内容 → 非独立段落
+        assert!(parse_standalone_image("see ![a](b.png)").is_none());
+        assert!(parse_standalone_image("![a](b.png) caption").is_none());
+        // 列表前缀 → 非独立
+        assert!(parse_standalone_image("- ![a](b.png)").is_none());
+        // title 形式
+        assert!(parse_standalone_image("![a](b.png \"t\")").is_some());
+    }
+
+    #[test]
+    fn rewrite_inline_images_to_links() {
+        assert_eq!(
+            rewrite_inline_images("see ![shot](img.png) here"),
+            "see [shot](img.png) here"
+        );
+        assert_eq!(
+            rewrite_inline_images("![a](x.png) and ![b](y.png)"),
+            "[a](x.png) and [b](y.png)"
+        );
+        // 非图片不动
+        assert_eq!(
+            rewrite_inline_images("plain [link](a.md) text"),
+            "plain [link](a.md) text"
+        );
+        // 无图片直接返回
+        assert_eq!(rewrite_inline_images("nothing"), "nothing");
+    }
+
+    #[test]
+    fn split_segments_extracts_standalone_image() {
+        let md = "# Title\n\npara text\n\n![logo](./logo.png)\n\nafter\n";
+        let segs = split_at_fences(md);
+        let mut images = 0;
+        for seg in &segs {
+            if let Segment::Image { alt, src } = seg {
+                images += 1;
+                assert_eq!(alt, "logo");
+                assert_eq!(src, "./logo.png");
+            }
+        }
+        assert_eq!(images, 1);
+        // prose 段不含图片行
+        for seg in &segs {
+            if let Segment::Prose(text) = seg {
+                assert!(!text.contains("!["));
+            }
+        }
+    }
+
+    #[test]
+    fn inline_image_in_prose_becomes_styled_link() {
+        let md = "before ![shot](./shot.png) after\n";
+        let skin = MadSkin::default();
+        let hl = Highlighter::new();
+        let (lines, links, images) = markdown_to_lines(md, 60, &skin, &hl, None, Path::new("/"));
+        assert!(images.is_empty());
+        // 行内图片降级为链接(可点击)
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "./shot.png");
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("shot"), "line: {text}");
+        assert!(text.contains("./shot.png"), "line: {text}");
+    }
+
+    #[test]
+    fn standalone_image_disabled_falls_back_to_link() {
+        let md = "![alt text](./pic.png)\n";
+        let skin = MadSkin::default();
+        let hl = Highlighter::new();
+        // img = None(图片禁用)→ 🖼 链接行
+        let (lines, links, images) = markdown_to_lines(md, 60, &skin, &hl, None, Path::new("/"));
+        assert!(images.is_empty());
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "./pic.png");
+        assert_eq!(links[0].start, 0);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "🖼 alt text (./pic.png)");
+    }
+
+    #[test]
+    fn standalone_image_ready_places_placeholder_rows() {
+        let md = "para\n\n![pic](./tiny.png)\n\nmore\n";
+        let skin = MadSkin::default();
+        let hl = Highlighter::new();
+        let ctx = ImageCtx::new(ImagePolicy::Lazy); // halfblocks,无需终端
+        let target_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../test/fixtures/img/tiny.png");
+        let src = target_src.to_str().unwrap().to_string();
+
+        // 先同步加载一次(等 Ready)拿到行数,再验证 markdown 管线的占位行为
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut img_h = 0u16;
+        loop {
+            match ctx.get_or_load(&src, Path::new("/"), Size::new(60, MAX_IMG_ROWS)) {
+                Render::Ready(proto) => {
+                    img_h = proto.size().height;
+                    break;
+                }
+                Render::Failed(e) => panic!("load failed: {e}"),
+                Render::Loading => {
+                    assert!(std::time::Instant::now() < deadline, "load timeout");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+        assert!(img_h > 0);
+
+        let md = format!("para\n\n![pic]({src})\n\nmore\n");
+        let (lines, _links, images) = markdown_to_lines(&md, 60, &skin, &hl, Some(&ctx), Path::new("/"));
+        assert_eq!(images.len(), 1);
+        let im = &images[0];
+        assert_eq!(im.h, img_h);
+        assert_eq!(im.proto.size().height, img_h);
+        // lines 总数 = para 行 + 空行分隔 + 图片占位 h 行 + more
+        // (termimad 的空段落会折叠,直接验证 images[0].line 后连续 h 行存在)
+        assert!(im.line + img_h as usize <= lines.len());
     }
 }

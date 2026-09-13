@@ -557,6 +557,117 @@ def scenario_M():
     check(code == 0, "M8 quit 0")
 
 
+# --------------------------------------------------------------------------
+# N. 图片渲染(DECISIONS D15):pyte 不支持图形协议,统一用 DLOOK_IMAGE_PROTOCOL
+#    =halfblocks 断言半块字符 + truecolor 输出;远程用本地 http server。
+# --------------------------------------------------------------------------
+def _sgr_mouse(kind, btn, col, row):
+    return f"\x1b[<{btn};{col};{row}{kind}"
+
+
+def _half_rows(s):
+    return [i for i, l in enumerate(s.screen_text().split("\n"))
+            if "\u2580" in l or "\u2584" in l]
+
+
+def scenario_N():
+    import http.server
+    import threading
+    import functools
+    print("== N-images ==")
+    env = dict(os.environ, DLOOK_IMAGE_PROTOCOL="halfblocks")
+
+    # N1: markdown 内本地图片 → 半块字符 + truecolor
+    s = session("img-local.md", env=env)
+    check(s.wait_for("Images Fixture", 6), "N1 md start")
+    # 图片加载是异步线程,轮询等待占位行被替换
+    deadline = time.time() + 6
+    while time.time() < deadline and not _half_rows(s):
+        s.feed(0.2)
+    rows = _half_rows(s)
+    check(len(rows) >= 2, f"N1 local image rendered as halfblocks (rows {rows})")
+    check("\x1b[38;2;" in s.raw_text() or "\x1b[48;2;" in s.raw_text(),
+          "N1 truecolor SGR for image pixels")
+    check("text before image" in s.screen_text(), "N1 text around image intact")
+
+    # N2: 行内图片 → 降级为可点击链接(label + url)
+    check("tiny\u2197" in s.screen_text() and "inline image" in s.screen_text(),
+          "N2 inline image degrades to link")
+
+    # N3: 缺失图片 → 失败提示行
+    check("unavailable" in s.screen_text() and "not found" in s.screen_text(),
+          "N3 missing image error line")
+
+    # N4: 点击行内图片链接 → 图片模式打开 + ⌫ 返回
+    cell = None
+    for r, line in enumerate(s.screen.display, start=1):
+        c = line.find("tiny\u2197")
+        if c >= 0 and "inline" in line:
+            cell = (c + 3, r)
+            break
+    check(cell is not None, "N4 find inline image link")
+    if cell:
+        col, row = cell
+        s.send(_sgr_mouse("M", 0, col, row)); s.feed(0.15)
+        s.send(_sgr_mouse("m", 0, col, row)); s.feed(0.6)
+        check(s.wait_for("tiny.png", 5), "N4 click opens image in dlook")
+        deadline = time.time() + 5
+        while time.time() < deadline and not _half_rows(s):
+            s.feed(0.2)
+        check(bool(_half_rows(s)), "N4 image renders in image mode")
+        check("back" in s.row(24), "N4 footer shows back hint")
+        s.send_key("Backspace"); s.feed(0.5)
+        check("img-local.md" in s.row(1), "N4 backspace returns to md")
+
+    s.send_key("q"); code = s.wait_exit(3); s.close()
+    check(code == 0, "N4 quit 0")
+
+    # N5: 直接打开图片文件(图片模式)
+    s = session("img/tiny.png", env=env)
+    deadline = time.time() + 6
+    while time.time() < deadline and not _half_rows(s):
+        s.feed(0.2)
+    check(bool(_half_rows(s)), "N5 direct image open renders")
+    check("tiny.png" in s.row(1), "N5 header shows image name")
+    check("q quit" in s.screen_text(), "N5 footer present")
+    s.send_key("q"); s.wait_exit(3); s.close()
+
+    # N6: 远程图片(本地 http server)
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler,
+                                directory=os.path.join(FIX, "img"))
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    import tempfile
+    remote_md = os.path.join(tempfile.gettempdir(), "dlook-e2e-remote.md")
+    with open(remote_md, "w") as f:
+        f.write(f"# Remote Image\n\n![remote gradient](http://127.0.0.1:{port}/gradient.png)\n")
+    s = PtySession(BIN + [remote_md], cols=80, rows=24, env=env, cwd=ROOT)
+    s.start()
+    check(s.wait_for("Remote Image", 6), "N6 md start")
+    deadline = time.time() + 8
+    while time.time() < deadline and not _half_rows(s):
+        s.feed(0.2)
+    check(bool(_half_rows(s)), "N6 remote image fetched and rendered")
+    s.send_key("q"); s.wait_exit(3); s.close()
+    srv.shutdown()
+
+    # N7: DLOOK_IMAGE_PROTOCOL=off → 图片降级为 🖼 链接行,点击可跳转图片模式
+    env_off = dict(os.environ, DLOOK_IMAGE_PROTOCOL="off")
+    s = session("img-off.md", env=env_off)
+    check(s.wait_for("Images Off", 6), "N7 md start (images off)")
+    check("\U0001f5bc tiny logo" in s.screen_text(), "N7 fallback link line")
+    check("(img/tiny.png)" in s.screen_text(), "N7 fallback url shown")
+    check(not _half_rows(s), "N7 no image rendering when off")
+    s.send_key("q"); s.wait_exit(3); s.close()
+
+    # N8: 非 TTY 直开图片 → 明确报错 + rc 1
+    r = subprocess.run(BIN + [os.path.join(FIX, "img/tiny.png")],
+                       capture_output=True, text=True, env=env, cwd=ROOT)
+    check(r.returncode == 1, "N8 non-tty image exits 1")
+    check("image" in r.stderr, "N8 non-tty image error message")
+
+
 def main():
     print(f"BIN = {BIN}")
     print(f"FIX = {FIX}")
@@ -567,7 +678,7 @@ def main():
 
     for sc in [scenario_A, scenario_B, scenario_C, scenario_D,
                scenario_E, scenario_F, scenario_G, scenario_H, scenario_I,
-               scenario_J, scenario_K, scenario_L, scenario_M]:
+               scenario_J, scenario_K, scenario_L, scenario_M, scenario_N]:
         try:
             sc()
         except Exception as ex:

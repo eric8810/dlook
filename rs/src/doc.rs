@@ -1,15 +1,32 @@
 //! Doc 模型 + 滚动数学（1:1 复刻 E2E B 用例的 clamp 行为）。
 
+use std::sync::Arc;
+
 use ratatui::text::Line;
+use ratatui_image::sliced::SlicedProtocol;
 
 use crate::lang::Mode;
 use crate::links::LinkSpan;
+
+/// 文档中的一张图片:占位 `line .. line+h` 行,由 Viewport 用图形协议绘制。
+/// 图片行在 `lines` 中为空行——滚动/选区/链接坐标全部照常工作。
+#[derive(Clone)]
+pub struct DocImage {
+    /// 图片首行在 doc.lines 中的索引。
+    pub line: usize,
+    /// 协议编码(ratatui-image sliced;支持滚动部分可见,尺寸见 size())。
+    pub proto: Arc<SlicedProtocol>,
+    /// 图片高度(行数)。
+    pub h: u16,
+}
 
 pub struct Doc {
     /// 整篇文档渲染后的带样式行（已按当前宽度换行/截断）。
     pub lines: Vec<Line<'static>>,
     /// 行内链接的可点击区域（内容坐标，随 lines 一起重建）。
     pub links: Vec<LinkSpan>,
+    /// 图片放置记录(内容坐标,随 lines 一起重建;DECISIONS D15)。
+    pub images: Vec<DocImage>,
     /// 滚动位置（视口首行在 lines 中的索引）。
     pub top: usize,
     /// 预览模式（保留用于模式感知的重排决策）。
@@ -25,10 +42,12 @@ impl Doc {
         mode: Mode,
         width: u16,
         links: Vec<LinkSpan>,
+        images: Vec<DocImage>,
     ) -> Self {
         Self {
             lines,
             links,
+            images,
             top: 0,
             mode,
             width,
@@ -57,11 +76,13 @@ impl Doc {
         &mut self,
         lines: Vec<Line<'static>>,
         links: Vec<LinkSpan>,
+        images: Vec<DocImage>,
         width: u16,
         body_h: usize,
     ) {
         self.lines = lines;
         self.links = links;
+        self.images = images;
         self.width = width;
         self.set_top(self.top, body_h);
     }

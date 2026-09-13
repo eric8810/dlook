@@ -4,9 +4,9 @@
 //! 文件变更热重载（stat 轮询）/ 文本拖选与复制（selection）/ cleanup。
 
 use std::io::{self, IsTerminal, Stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::event::{
@@ -27,8 +27,9 @@ use ratatui::Terminal;
 
 use crate::ansi_lines;
 use crate::content;
-use crate::doc::Doc;
+use crate::doc::{Doc, DocImage};
 use crate::highlight::Highlighter;
+use crate::images::{self, ImageCtx};
 use crate::lang::{self, Mode};
 use crate::links;
 use crate::markdown;
@@ -137,6 +138,14 @@ pub fn run(
 
     let mut stdout = io::stdout();
     let _ = execute!(stdout, EnterAlternateScreen, crossterm::event::EnableMouseCapture);
+
+    // 终端图形协议探测(DECISIONS D15):必须在进入 raw mode / 事件读取前调用,
+    // from_query_stdio 需直接读写 stdin 收终端响应;纯文本文档跳过探测保持即时启动。
+    let img_ctx = ImageCtx::new(images::acquire_policy(images::should_query_protocol(
+        mode,
+        initial_content,
+    )));
+
     let _ = enable_raw_mode();
 
     let mut terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
@@ -149,9 +158,8 @@ pub fn run(
 
     let (w, _h) = current_size(&terminal);
     let content_w = content_width(w);
-    let (lines, doc_links) =
-        build_lines(initial_content, mode, syntax_token, content_w, &highlighter, &skin);
-    let mut doc = Doc::new(lines, mode, content_w, doc_links);
+    let (lines, doc_links, doc_images) = build_initial(mode, file_path, initial_content, syntax_token, content_w, &highlighter, &skin, &img_ctx);
+    let mut doc = Doc::new(lines, mode, content_w, doc_links, doc_images);
 
     let exit_code = event_loop(
         &mut terminal,
@@ -161,6 +169,7 @@ pub fn run(
         syntax_token,
         &highlighter,
         &skin,
+        &img_ctx,
     );
 
     // Cleanup
@@ -212,6 +221,31 @@ enum MouseAction {
     OpenLink(String),
 }
 
+/// 当前文件所在目录(相对图片/链接按它解析)。
+fn base_dir_of(path: &str) -> PathBuf {
+    Path::new(path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+/// 图片模式直开时的注册表 key:`file:<绝对路径>?<mtime>.<size>`。
+/// 文件变化 → stat 指纹变化 → 新 key → 重新加载(热重载语义)。
+fn image_src_for(path: &str) -> String {
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    let v = file_stamp(path).map_or_else(
+        || "0.0".to_string(),
+        |(t, sz)| {
+            let nanos = t
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("{nanos}.{sz}")
+        },
+    );
+    format!("file:{}?v{}", abs.display(), v)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn event_loop(
     terminal: &mut Term,
@@ -221,6 +255,7 @@ fn event_loop(
     syntax_token: Option<&'static str>,
     hl: &Highlighter,
     skin: &termimad::MadSkin,
+    img_ctx: &ImageCtx,
 ) -> i32 {
     let mut nav = Nav {
         path: file_path.to_string(),
@@ -234,6 +269,8 @@ fn event_loop(
     let mut ui = UiState::new();
     // 外部打开器(xdg-open 等)子进程句柄,非阻塞收割避免僵尸
     let mut children: Vec<Child> = Vec::new();
+    // 图片加载/重编码版本(变化 → 重排,同热重载路径;DECISIONS D15)
+    let mut img_version = img_ctx.dirty_version();
 
     loop {
         children.retain_mut(|c| c.try_wait().map(|r| r.is_none()).unwrap_or(false));
@@ -276,7 +313,7 @@ fn event_loop(
                     match map_key(k) {
                         Action::Quit(code) => return code,
                         Action::Back => {
-                            go_back(terminal, doc, &mut nav, &mut content, &mut ui, hl, skin);
+                            go_back(terminal, doc, &mut nav, &mut content, &mut ui, hl, skin, img_ctx);
                         }
                         Action::Scroll(delta) => {
                             let body_h = body_height(terminal);
@@ -306,17 +343,15 @@ fn event_loop(
                             &raw,
                             hl,
                             skin,
+                            img_ctx,
                         );
                     }
                 }
                 Ok(Event::Resize(w, h)) => {
-                    let body_h = (h as usize).saturating_sub(2);
-                    let cw = content_width(w);
+                    let _ = (w, h);
                     // 重排后行结构变化,内容坐标失效 → 清除选区
                     ui.sel = None;
-                    let (new_lines, new_links) =
-                        build_lines(&content, nav.mode, nav.syntax_token, cw, hl, skin);
-                    doc.replace_lines(new_lines, new_links, cw, body_h);
+                    rebuild_doc(terminal, doc, &nav, &content, &mut ui, hl, skin, img_ctx);
                 }
                 Ok(_) => {}
                 Err(_) => return 1,
@@ -330,24 +365,64 @@ fn event_loop(
             edge_autoscroll(terminal, doc, &mut ui);
         }
 
+        // 图片就绪(加载/重编码完成)→ 重排,占位行换成图片行(或更新尺寸)。
+        if img_ctx.dirty_version() != img_version {
+            img_version = img_ctx.dirty_version();
+            ui.sel = None; // 行结构变化,选区坐标失效
+            rebuild_doc(terminal, doc, &nav, &content, &mut ui, hl, skin, img_ctx);
+        }
+
         // 热重载:stat 轮询(mtime+size 变化即重排),跟随当前导航文件。
         // 替代 notify 依赖(省 ~150KB 体积);事件循环本就以 ~200ms 轮询,
         // 检测延迟同量级。
         let stamp = file_stamp(&nav.path);
         if stamp != last_stamp {
             last_stamp = stamp;
-            // 文件被修改：重新读取并重排
-            if let Some(new_content) = content::reload_content(&nav.path) {
+            ui.sel = None; // 行结构变化,选区坐标失效
+            if nav.mode == Mode::Image {
+                // 图片文件变化:image_src_for 的指纹 key 变化 → 重新加载
+                rebuild_doc(terminal, doc, &nav, &content, &mut ui, hl, skin, img_ctx);
+            } else if let Some(new_content) = content::reload_content(&nav.path) {
                 content = new_content;
-                ui.sel = None; // 行结构变化,选区坐标失效
-                let (w, _h) = current_size(terminal);
-                let cw = content_width(w);
-                let body_h = body_height(terminal);
-                let (new_lines, new_links) =
-                    build_lines(&content, nav.mode, nav.syntax_token, cw, hl, skin);
-                doc.replace_lines(new_lines, new_links, cw, body_h);
+                rebuild_doc(terminal, doc, &nav, &content, &mut ui, hl, skin, img_ctx);
             }
+            // 读失败:保留旧内容
         }
+    }
+}
+
+/// 按当前模式与内容重建 Doc 行集(resize / 热重载 / 图片就绪共用)。
+#[allow(clippy::too_many_arguments)]
+fn rebuild_doc(
+    terminal: &mut Term,
+    doc: &mut Doc,
+    nav: &Nav,
+    content: &str,
+    ui: &mut UiState,
+    hl: &Highlighter,
+    skin: &termimad::MadSkin,
+    img_ctx: &ImageCtx,
+) {
+    let _ = ui; // 选区清理由调用方完成
+    let (w, _h) = current_size(terminal);
+    let cw = content_width(w);
+    let body_h = body_height(terminal);
+    if nav.mode == Mode::Image {
+        let src = image_src_for(&nav.path);
+        let (lines, images) = build_image_doc(img_ctx, &src, cw);
+        doc.replace_lines(lines, Vec::new(), images, cw, body_h);
+    } else {
+        let (lines, links, images) = build_lines(
+            content,
+            nav.mode,
+            nav.syntax_token,
+            cw,
+            hl,
+            skin,
+            img_ctx,
+            &base_dir_of(&nav.path),
+        );
+        doc.replace_lines(lines, links, images, cw, body_h);
     }
 }
 
@@ -356,7 +431,7 @@ fn event_loop(
 // ---------------------------------------------------------------------------
 
 /// 解析点击的链接目标并执行:本地文件 → 内部跳转;外部 URL → 系统打开器;
-/// 锚点/无效目标 → 状态栏提示。
+/// 锚点/无效目标 → 状态栏提示。图片文件(含 file://)在应用内以图片模式打开。
 #[allow(clippy::too_many_arguments)]
 fn open_link(
     terminal: &mut Term,
@@ -368,14 +443,12 @@ fn open_link(
     raw: &str,
     hl: &Highlighter,
     skin: &termimad::MadSkin,
+    img_ctx: &ImageCtx,
 ) {
-    let base_dir = Path::new(&nav.path)
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default();
+    let base_dir = base_dir_of(&nav.path);
     match links::classify(&base_dir, raw) {
         links::Target::Local(path) => {
-            navigate(terminal, doc, nav, content, ui, &path, hl, skin);
+            navigate(terminal, doc, nav, content, ui, &path, hl, skin, img_ctx);
         }
         links::Target::External(url) => {
             if open_external(&url, children) {
@@ -397,6 +470,7 @@ fn open_link(
 }
 
 /// 跳转到本地文件:校验可读 → push 历史 → 重排渲染。失败仅状态栏提示。
+/// 图片扩展名走图片模式(字节由 ImageCtx 加载),其余按文本校验。
 #[allow(clippy::too_many_arguments)]
 fn navigate(
     terminal: &mut Term,
@@ -407,7 +481,34 @@ fn navigate(
     target: &Path,
     hl: &Highlighter,
     skin: &termimad::MadSkin,
+    img_ctx: &ImageCtx,
 ) {
+    if lang::is_image_ext(&target.to_string_lossy()) {
+        // 图片目标:只校验存在/非目录,字节交给 ImageCtx 加载线程
+        match std::fs::metadata(target) {
+            Err(_) => {
+                ui.status = Some((
+                    format!("link target not found: {}", target.display()),
+                    Instant::now(),
+                ));
+            }
+            Ok(meta) if meta.is_dir() => {
+                ui.status = Some((
+                    format!("link target is a directory: {}", target.display()),
+                    Instant::now(),
+                ));
+            }
+            Ok(_) => {
+                nav.history.push(HistoryEntry {
+                    path: nav.path.clone(),
+                    top: doc.top,
+                });
+                let path_str = target.to_string_lossy().into_owned();
+                load_doc(terminal, doc, nav, content, ui, &path_str, String::new(), hl, skin, img_ctx);
+            }
+        }
+        return;
+    }
     match content::read_for_navigate(target) {
         Err(e) => {
             let p = target.display();
@@ -424,7 +525,7 @@ fn navigate(
                 path: nav.path.clone(),
                 top: doc.top,
             });
-            load_doc(terminal, doc, nav, content, ui, &target.to_string_lossy(), text, hl, skin);
+            load_doc(terminal, doc, nav, content, ui, &target.to_string_lossy(), text, hl, skin, img_ctx);
         }
     }
 }
@@ -439,23 +540,29 @@ fn go_back(
     ui: &mut UiState,
     hl: &Highlighter,
     skin: &termimad::MadSkin,
+    img_ctx: &ImageCtx,
 ) {
     let Some(entry) = nav.history.last() else {
         return;
     };
     let (path, top) = (entry.path.clone(), entry.top);
-    match content::read_for_navigate(Path::new(&path)) {
-        Err(_) => {
-            ui.status =
-                Some((format!("cannot go back, unreadable: {path}"), Instant::now()));
+    // 历史栈里的文件类型在跳转时已校验过;回跳时图片模式不重读字节
+    let text = if lang::is_image_ext(&path) {
+        String::new()
+    } else {
+        match content::read_for_navigate(Path::new(&path)) {
+            Ok(t) => t,
+            Err(_) => {
+                ui.status =
+                    Some((format!("cannot go back, unreadable: {path}"), Instant::now()));
+                return;
+            }
         }
-        Ok(text) => {
-            nav.history.pop();
-            load_doc(terminal, doc, nav, content, ui, &path, text, hl, skin);
-            // 恢复跳转前的滚动位置
-            doc.set_top(top, body_height(terminal));
-        }
-    }
+    };
+    nav.history.pop();
+    load_doc(terminal, doc, nav, content, ui, &path, text, hl, skin, img_ctx);
+    // 恢复跳转前的滚动位置
+    doc.set_top(top, body_height(terminal));
 }
 
 /// 按新文件装载 Doc(路径/模式/内容/渲染全部切换)。
@@ -470,6 +577,7 @@ fn load_doc(
     text: String,
     hl: &Highlighter,
     skin: &termimad::MadSkin,
+    img_ctx: &ImageCtx,
 ) {
     nav.path = path.to_string();
     (nav.mode, nav.syntax_token) = lang::detect_mode_lang(path);
@@ -477,8 +585,23 @@ fn load_doc(
     ui.sel = None; // 换文档,旧选区坐标失效
     let (w, _h) = current_size(terminal);
     let cw = content_width(w);
-    let (lines, new_links) = build_lines(content, nav.mode, nav.syntax_token, cw, hl, skin);
-    *doc = Doc::new(lines, nav.mode, cw, new_links);
+    if nav.mode == Mode::Image {
+        let src = image_src_for(&nav.path);
+        let (lines, images) = build_image_doc(img_ctx, &src, cw);
+        *doc = Doc::new(lines, nav.mode, cw, Vec::new(), images);
+    } else {
+        let (lines, new_links, images) = build_lines(
+            content,
+            nav.mode,
+            nav.syntax_token,
+            cw,
+            hl,
+            skin,
+            img_ctx,
+            &base_dir_of(&nav.path),
+        );
+        *doc = Doc::new(lines, nav.mode, cw, new_links, images);
+    }
 }
 
 /// 用系统打开器打开外部 URL(Linux xdg-open / macOS open / Windows start)。
@@ -758,6 +881,7 @@ fn render_frame(
         lines: &doc.lines,
         top: doc.top,
         selection: sel,
+        images: &doc.images,
     };
     f.render_widget(viewport, body_area);
 
@@ -775,7 +899,77 @@ fn render_frame(
     f.render_widget(footer, chunks[2]);
 }
 
-/// 根据 mode + content 生成 Vec<Line> 与行内链接区域。
+/// 启动时构建 Doc 行集(区分图片模式与文本模式)。
+#[allow(clippy::too_many_arguments)]
+fn build_initial(
+    mode: Mode,
+    file_path: &str,
+    initial_content: &str,
+    syntax_token: Option<&str>,
+    width: u16,
+    hl: &Highlighter,
+    skin: &termimad::MadSkin,
+    img_ctx: &ImageCtx,
+) -> (
+    Vec<Line<'static>>,
+    Vec<crate::links::LinkSpan>,
+    Vec<DocImage>,
+) {
+    if mode == Mode::Image {
+        let src = image_src_for(file_path);
+        let (lines, images) = build_image_doc(img_ctx, &src, width);
+        return (lines, Vec::new(), images);
+    }
+    build_lines(
+        initial_content,
+        mode,
+        syntax_token,
+        width,
+        hl,
+        skin,
+        img_ctx,
+        &base_dir_of(file_path),
+    )
+}
+
+/// 图片模式直开:单张图片(或加载/失败占位行)。
+fn build_image_doc(
+    img_ctx: &ImageCtx,
+    src: &str,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<DocImage>) {
+    use ratatui::layout::Size;
+    match img_ctx.get_or_load(src, Path::new(""), Size::new(width, images::MAX_IMG_ROWS)) {
+        images::Render::Ready(proto) => {
+            let size = proto.size();
+            let doc_img = DocImage {
+                line: 0,
+                proto,
+                h: size.height,
+            };
+            (
+                std::iter::repeat(Line::default()).take(size.height as usize).collect(),
+                vec![doc_img],
+            )
+        }
+        images::Render::Loading => (
+            vec![Line::default().spans(vec![Span::styled(
+                "⏳ loading image …",
+                Style::default().add_modifier(Modifier::DIM),
+            )])],
+            Vec::new(),
+        ),
+        images::Render::Failed(e) => (
+            vec![Line::default().spans(vec![Span::styled(
+                format!("✗ image unavailable: {e}"),
+                Style::default().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM),
+            )])],
+            Vec::new(),
+        ),
+    }
+}
+
+/// 根据 mode + content 生成 Vec<Line>、行内链接区域与图片放置记录。
 fn build_lines(
     content: &str,
     mode: Mode,
@@ -783,16 +977,32 @@ fn build_lines(
     width: u16,
     hl: &Highlighter,
     skin: &termimad::MadSkin,
-) -> (Vec<Line<'static>>, Vec<crate::links::LinkSpan>) {
+    img_ctx: &ImageCtx,
+    base_dir: &Path,
+) -> (
+    Vec<Line<'static>>,
+    Vec<crate::links::LinkSpan>,
+    Vec<DocImage>,
+) {
     match mode {
-        Mode::Markdown => markdown::markdown_to_lines(content, width, skin, hl),
+        Mode::Markdown => markdown::markdown_to_lines(content, width, skin, hl, Some(img_ctx), base_dir),
         Mode::Code => {
             let ansi = hl.highlight_to_ansi(content, syntax_token);
-            (ansi_lines::to_lines(&ansi, width), Vec::new())
+            (ansi_lines::to_lines(&ansi, width), Vec::new(), Vec::new())
         }
         Mode::Mermaid => match mermaid::render_mermaid_to_ansi(content, width) {
-            Ok(ansi) => (ansi_lines::to_lines_untruncated(&ansi), Vec::new()),
-            Err(_) => (ansi_lines::to_lines(content, width), Vec::new()),
+            Ok(ansi) => (
+                ansi_lines::to_lines_untruncated(&ansi),
+                Vec::new(),
+                Vec::new(),
+            ),
+            Err(_) => (
+                ansi_lines::to_lines(content, width),
+                Vec::new(),
+                Vec::new(),
+            ),
         },
+        // 图片模式由 build_image_doc 处理,不进文本管线
+        Mode::Image => (Vec::new(), Vec::new(), Vec::new()),
     }
 }

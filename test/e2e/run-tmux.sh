@@ -262,6 +262,41 @@ scenario_autoscroll() {
 # ===========================================================================
 # T7. resize
 # ===========================================================================
+# ===========================================================================
+# T-images (DECISIONS D15: 图片渲染;tmux 不支持图形协议,验证 halfblocks 路径
+# 的真终端 truecolor 输出。kitty/sixel/iTerm2 协议路径由协议实现方(ratatui-image)
+# 保证,pyte 场景 N 覆盖降级逻辑)
+# ===========================================================================
+scenario_images() {
+  echo "== T-images (D15 halfblocks truecolor) =="
+  pane_run "DLOOK_IMAGE_PROTOCOL=halfblocks $BIN $FIX/img-local.md"
+  local i
+  for ((i = 0; i < 60; i++)); do
+    cap_plain | grep -qE '▀|▄' && break
+    sleep 0.1
+  done
+  cap_plain | grep -qE '▀|▄'; check $? "T30 md local image halfblocks render"
+  cap_esc  | grep -qF  '38;2;'; check $? "T31 image pixels truecolor SGR"
+  cap_plain | grep -q 'text before image'; check $? "T32 text around image intact"
+  cap_plain | grep -q 'unavailable'; check $? "T33 missing image error line"
+  quit_app
+
+  pane_run "DLOOK_IMAGE_PROTOCOL=halfblocks $BIN $FIX/img/tiny.png"
+  for ((i = 0; i < 60; i++)); do
+    cap_plain | grep -qE '▀|▄' && break
+    sleep 0.1
+  done
+  cap_plain | grep -qE '▀|▄'; check $? "T34 direct image open renders"
+  cap_plain | grep -q 'tiny.png'; check $? "T35 image mode header shows filename"
+  # 图片模式滚动到尾(2 行图,应到文档底)不崩,footer 正常
+  T send-keys -t "$SESS" G; sleep 0.3
+  cap_plain | grep -q 'q quit'; check $? "T36 image mode G/footer intact"
+  quit_app
+}
+
+# ===========================================================================
+# T-resize
+# ===========================================================================
 scenario_resize() {
   echo "== T-resize =="
   pane_run "$BIN $FIX/style.md"
@@ -286,6 +321,7 @@ main() {
   scenario_selection
   scenario_autoscroll
   scenario_resize
+  scenario_images
 
   echo
   echo "RESULT: PASS=$PASS FAIL=$FAIL"
