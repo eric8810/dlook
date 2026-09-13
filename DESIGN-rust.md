@@ -207,10 +207,14 @@ doc-preview/                # 现有 TS 版保持不动,Rust 版在同目录新�
 
 ## 5. 关键模块设计
 
-### 5.1 `content.rs` —— 三模式判定
+### 5.1 `content.rs` —— 四模式判定
+
+> 2026-09-13(D15)追加 `Mode::Image`:图片扩展名(png/jpg/jpeg/gif/webp/bmp/ico/tiff)
+> 跳过二进制检测与文本读取,字节由 [images.rs](rs/src/images.rs) 的加载线程按需读取;
+> 实现细节见 [DECISIONS.md](DECISIONS.md) D15。
 
 ```rust
-pub enum Mode { Markdown, Code, Mermaid }
+pub enum Mode { Markdown, Code, Mermaid, Image }
 
 pub struct Loaded {
     pub file_name: String,
@@ -236,6 +240,7 @@ pub fn load_content(path: &str) -> Result<Loaded, LoadError> {
 模式判定(`lang.rs`):
 - `.md`/`.markdown` → `Mode::Markdown`
 - `.mmd`/`.mermaid` → `Mode::Mermaid`
+- 图片扩展名 → `Mode::Image`(D15)
 - 其它 → `Mode::Code` + `detect_lang(path)`(扩展名→syntect 语言 ID,1:1 搬 [lang.ts](../src/lang.ts))
 
 ### 5.2 `highlight.rs` —— syntect code → ANSI → `Vec<Line>`

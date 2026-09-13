@@ -22,6 +22,7 @@
 | D12 | 产物体积 | 保持全功能 6.59MB;UPX 与功能裁剪均否决 | — | ✅ 已决策 |
 | D13 | 项目名/仓库名 | 统一改为 dlook(含 GitHub repo 重命名) | S | ✅ 已实施 |
 | D14 | 本地文件链接点击跳转 | A:内容坐标 LinkSpan + 应用内导航栈;外部链接交系统打开器 | M | ✅ 已实施 |
+| D15 | 图片渲染(翻案 D9) | 终端图形协议(kitty/sixel/iTerm2+halfblocks 回退)+ 直开图片文件 | L | ✅ 已实施 |
 
 ---
 
@@ -122,7 +123,9 @@ katex,实际不可用**。Rust 侧无等价轻量方案。
 **背景**:vue-tui 库能力为 kitty/iTerm2 图形协议(需 resolver);Node 版未用。Rust 侧可用
 `ratatui-image`,但需检测终端协议支持,且 alt-screen + 滚动视口下图片滚动/重绘复杂度高。
 
-**推荐 A:不做(远期)**。文本预览器场景收益低;若做,建议独立评估 ratatui-image 与协议探测。
+**原决策(2026-09-03)**:A:不做(远期)。
+**2026-09-13 翻案,见 [D15](#d15-图片渲染2026-09-13-追加)**:用户需求驱动,ratatui-image 11
+已提供滚动部分可见(sliced 模块)与协议探测/回退,复杂度风险已被库消化。
 
 ## D10 markdown 主题配置化(对应 G9)
 
@@ -221,7 +224,28 @@ notify → stat 轮询热重载(行为等价,事件循环本就以 200ms 轮询,
 
 ---
 
-## 决策记录
+## D15 图片渲染(2026-09-13 追加,翻案 D9)
+
+**背景**:用户需求——dlook 支持渲染本地/远程图片。D9 曾以「alt-screen 滚动视口下图片滚动/重绘复杂度高」为由不做;重评发现 ratatui-image 11 已把两块硬骨头(协议探测+回退、滚动部分可见)做成了库能力,风险被消化。
+
+**方案**(用户选定:终端图形协议 + 支持直开图片文件):
+
+- **协议栈**:ratatui-image 11(与本项目 ratatui 0.30 / crossterm 0.29 完全匹配,default-features 去掉 chafa)。启动时 `Picker::from_query_stdio()` 探测 → kitty/sixel/iTerm2 → 无响应回退 halfblocks(半块字符 truecolor,任何终端可用);tmux 自动检测 + `allow-passthrough on`。环境变量 `DLOOK_IMAGE_PROTOCOL=auto|halfblocks|off`。
+- **滚动集成**:核心洞见——图片在 `doc.lines` 里占位空行(行数=图片行数),滚动/选区/链接/`max_top` 数学**全部照旧**;`Doc.images` 记录 `(line, SlicedProtocol)` 放置,Viewport 渲染完文字行后把 `SlicedImage`(支持负 Y 位置=顶部滚出视口)画进 Buffer。ratatui-image sliced 模块按协议处理部分可见:Kitty 用 unicode placeholder 行偏移,Sixel 按 band 裁剪,iTerm2 逐行切片,Halfblocks 行跳过。
+- **加载管线**(images.rs):`ImageCtx` 注册表跨 rebuild 存活,src → {Loading/Ready/Failed};本地(相对 md 目录解析、percent-decode、64MB 上限)/http+https(ureq+rustls,10s 超时、16MB 上限、5 跳重定向)/`data:` URL(base64/percent)→ image crate 解码(>2560px 降采样)→ 协议编码,全部在后台线程;完成 bump dirty 计数,事件循环(200ms 轮询)发现变化即重排(同热重载路径)。resize 触发后台重编码,期间旧协议继续渲染(防闪烁);失败缓存不重试(防 rebuild 循环反复请求坏链接)。
+- **markdown 集成**:独立段落 `![alt](src)` 在 `split_at_fences` 阶段提取为 `Segment::Image`(不经 termimad);行内图片预处理降级为 `[alt](src)` 普通链接(样式化+可点击,与 vue-tui 的 alt-text 降级一致)。图片禁用(off)/失败 → `🖼 alt (src)` 链接行或 `✗` 错误行。
+- **直开图片文件**:扩展名(png/jpg/jpeg/gif/webp/bmp/ico/tiff)→ `Mode::Image`,跳过二进制拒绝;`dlook photo.png` 直接渲染;点击指向图片的本地链接在应用内打开(图片模式),⌫ 返回;非 TTY 直开图片 → 明确报错退出 1。热重载:图片模式的注册表 key 携带 stat 指纹(`file:<path>?v<mtime>.<size>`),文件变化自动重新加载。
+- **选区**:图片行不做反显(placeholder 的字符/颜色编码了图片 ID,REVERSED 会破坏 kitty 解码);拖选跨图片行复制为空行。
+
+**协议探测时机**:from_query_stdio 需直接读写 stdin,必须在事件循环前调用;且无响应终端要 2s 超时——因此**按需探测**:图片模式或 md 含 `![` 才查询,纯文本文档零启动开销;启动后热重载新引入的图片惰性降级 halfblocks(事件线程已存活,不能再探测 stdin)。
+
+**体积 checkpoint**:**6,589,160 → 9,207,584 字节(+2.62MB,+39.8%)**,构成≈image 解码器 +1.2MB、ratatui-image+icy_sixel +0.9MB、ureq+rustls +0.5MB。D12 的「保持全功能优先于体积」原则延续;若未来要回收,可裁 image 格式 feature 或远程支持。
+
+**验证**:单元 40(+15:图片语法解析/独立段判定/行内降级/data: URL/本地加载/协议尺寸/注册表缓存与失败缓存)/pyte E2E 138(+23,场景 N:本地图片 halfblock+truecolor、异步占位替换、行内降级链接、缺失错误行、点击跳转图片模式+⌫ 返回、直开、远程 http 图片、off 降级 🖼 链接、非 TTY rc=1)/tmux 40(+7,T30–T36:真终端 halfblocks truecolor、周边文本、直开、滚动)全过。
+
+**遗留**(记录不做):GIF 动画只取首帧;图片引用语法 `![alt][ref]` 不支持;远端图片失败不自动重试(重开文件即重试);kitty/sixel 协议路径无法在 pyte/tmux 中自动验证(两者都不支持图形协议),依赖 ratatui-image 的跨终端截图测试矩阵。
+
+
 
 
 
@@ -239,8 +263,9 @@ notify → stat 轮询热重载(行为等价,事件循环本就以 200ms 轮询,
 | D6 | A:`- [x]`/`[ ]`(含有序/嵌套)→ ☑/☐,仅 prose 段 | 2026-09-03 | markdown.rs `render_task_checkboxes`;E2E J5/J6 |
 | D7 | A(方案调整):termimad FmtText 路径把 TableRule 固定为 Other 位置、**不画外框**(与 D7 原前提不符),preset 切换无效 → 改为渲染后处理 `frame_tables`:按分隔线几何插入 `╭─┬─╮`/`╰─┴─╯` | 2026-09-03 | E2E J7;`skin.table_border_chars` 同时切 ROUNDED(为未来路径留位) |
 | D8 | A:不做 | 2026-09-03 | — |
-| D9 | A:不做(远期 ratatui-image) | 2026-09-03 | — |
+| D9 | A:不做(远期 ratatui-image) → **2026-09-13 翻案为 D15** | 2026-09-03 | ratatui-image 11 + sliced 模块消化了滚动/探测复杂度 |
 | D10 | A:不做 | 2026-09-03 | — |
 | D11 | A(①②均落地)+ B:拖选反显(SGR 7)、Shift+点击扩展、视口边缘自动滚动(120ms 节流)、**松开即 OSC 52 复制**(`crossterm osc52` feature)、`y`/Enter 手动复制、Esc 清除(无选区才退出)、状态栏 `copied N chars`;README 记录 Shift+拖动原生选择 | 2026-09-03 | 新增 `selection.rs`(内容坐标模型,滚动稳定)+ `viewport.rs` 反显;resize/热重载清除选区;复制失败静默降级;E2E K1–K10 |
 | D12 | 保持全功能 6.59MB(−91KB);UPX 实测可行(2.57MB)但用户否决;mermaid 链 3.47MB 不可内裁,1–2MB 目标放弃;采纳 notify→stat 轮询热重载(行为等价,去 watcher 线程与依赖) | 2026-09-03 | 体积构成见 D12 小节;验证 15+96+33+热重载冒烟全过 |
 | D14 | 本地文件链接应用内点击跳转:内容坐标 `LinkSpan`(links.rs)+ Nav 历史栈(⌫/Alt+← 返回,恢复滚动);本地链接 ↗ 标记(语法粗分),点击期校验(缺失/目录/二进制 → 状态栏);外部链接 xdg-open/open/start(spawn 不等待,非阻塞收割);`%XX` + `<空格路径>` 支持;顺带修复纯点击视口首/末行被 edge_autoscroll 平移的缺陷 | 2026-09-12 | 详见 D14 小节;markdown.rs 管线改为先 frame_tables 后 style_links(链接行号基于最终行集);验证 25+115+33 全过;E2E M1–M8 |
+| D15 | 图片渲染(翻案 D9):ratatui-image 11 协议探测(kitty/sixel/iTerm2 → halfblocks 回退)+ `Doc.images` 占位行集成(sliced 滚动部分可见)+ `ImageCtx` 后台加载注册表(本地/http(s)/data:,dirty 计数重排)+ md 独立段落图片/行内降级链接 + 直开图片文件(Mode::Image)+ `DLOOK_IMAGE_PROTOCOL` 环境变量 | 2026-09-13 | 详见 D15 小节;体积 6.59→9.21MB(+2.62MB);验证 40+138+40 全过;E2E N1–N8、tmux T30–T36 |

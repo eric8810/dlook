@@ -7,6 +7,9 @@
 > **实施状态(2026-09-03)**:G1–G7、G10 的补齐决策已全部实施并通过测试
 > (E2E A–L 96 项、单元测试 15 项全过);G8(图片)、G9(主题配置化)按决策不做。
 > 详见 [DECISIONS.md](DECISIONS.md) 决策记录。
+>
+> **更新(2026-09-13)**:G8 图片已实施(DECISIONS D15,翻案 D9)——kitty/sixel/iTerm2
+> 图形协议 + halfblocks 回退 + 远程/data: 源 + 直开图片文件;G9 维持不做。
 
 研究方法:读 vue-tui 的 `.d.ts` 类型声明与编译产物、Node 版 `src/`、Rust 版 `rs/src/`;
 并用 pty 分别运行 `preview`(Node)与 `dlook`(Rust)渲染同一份 markdown,抓取原始 ANSI 序列实测对比。
@@ -39,7 +42,7 @@
 | 任务列表 `- [x]` | ✅ checkbox | ✅ | ❌ 原样文本 | **Rust 缺(G5)** |
 | 删除线 | ⚠️ 降级为 dim | ⚠️ | ✅ 真 CrossedOut | Rust 略优 |
 | 数学公式 | ⚠️ optional katex → Unicode 近似(仅行内) | ❌ 未装 katex | ❌ | 平手(产品层均无,G7) |
-| 图片 | ⚠️ kitty/iTerm2 图形协议 + resolver | ❌ 未用 | ❌ | 平手(产品层均无,G8) |
+| 图片 | ⚠️ kitty/iTerm2 图形协议 + resolver | ❌ 未用 | ✅ kitty/sixel/iTerm2 + halfblocks 回退(D15) | **Rust 反超(G8)** |
 | 文本拖选+复制 | ✅ 拖选(反显/自动滚动)+ 松开即 OSC 52 复制 | ❌ 未启用(app 未传 `selection`,实测拖选零输出) | ❌ 无实现;原生选择需 Shift 绕过 | **两版都缺(G10)** |
 
 ---
@@ -96,12 +99,15 @@
   → 提取 Unicode 文本;`$$...$$` 块级公式无专门处理,原样直出;未装 katex → 原样黄亮文本。
 - Node 版未安装 katex → 实际不可用。
 
-### G8 图片(库能力,两版产品层都没有)
+### G8 图片(vue-tui 库能力,两版产品层原本都没有;**dlook 已反超,见 DECISIONS D15**)
 
 - vue-tui 路径:`imageRenderer` resolver 把 src 解析成 base64 → 终端支持时走
   **kitty graphics / iTerm2 inline image 协议**;`data:` URL(png/jpeg/gif/webp)可内联;
   sixel 能探测但 markdown 路径无编码器;不支持时降级为 alt 文本(带 href 可点击)。
   Node 版没传 resolver → 只有 data: URL 理论可用。
+- **dlook(2026-09-13,D15)**:ratatui-image 协议栈 kitty/sixel/iTerm2 + halfblocks 回退;
+  markdown 独立段落图片 + 本地/http(s)/data: 源 + `dlook photo.png` 直开;
+  滚动视口部分可见(sliced);行内图片降级链接(与 vue-tui 的 alt-text 降级一致)。
 
 ### G9 markdown 主题覆盖(库能力,产品层未用)
 
