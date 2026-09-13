@@ -22,10 +22,15 @@ ansi-to-tui = "8.0"
 # 图片渲染(D15):协议探测 + kitty/sixel/iTerm2/halfblocks,滚动视口用 sliced 模块
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
-# 远程图片 http/https 获取(rustls,无 openssl 依赖)
+# 远程图片/网页 http(s) 获取(rustls,无 openssl 依赖)
 ureq = { version = "2", default-features = false, features = ["tls"] }
 # data: URL 内联图片解码(ratatui-image 已引入,零额外体积)
 base64-simd = "0.8"
+# 音频播放(D16):rodio Player(play/pause/try_seek/volume)+ symphonia 解码全家桶
+# (flac/mp3/m4a+vorbis/wav;实测 +1.52MB,Linux 引入 libasound.so.2 链接依赖)
+rodio = "0.22"
+# 网页文本渲染(D16 L1):html2text 类型化注解(Link/Strong/Code/Image)→ dlook 行模型
+html2text = "0.17"
 
 [profile.release]
 opt-level = "z"

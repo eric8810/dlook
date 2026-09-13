@@ -33,6 +33,18 @@ fn fail(msg: &str) -> ! {
 }
 
 pub fn load_content(file_path: &str) -> Loaded {
+    let (mode, syntax_token) = detect_mode_lang(file_path);
+
+    // 网页 URL(D16): 无本地文件,内容由 web 模块抓取
+    if mode == Mode::Web && (file_path.starts_with("http://") || file_path.starts_with("https://")) {
+        return Loaded {
+            file_name: file_path.to_string(),
+            content: String::new(),
+            mode,
+            syntax_token,
+        };
+    }
+
     let meta = match fs::metadata(file_path) {
         Ok(m) => m,
         Err(_) => fail(&format!(
@@ -45,11 +57,9 @@ pub fn load_content(file_path: &str) -> Loaded {
         fail(&format!("error: '{}' is a directory", file_path));
     }
 
-    let (mode, syntax_token) = detect_mode_lang(file_path);
-
-    // 图片模式(DECISIONS D15):不读文本、不做二进制检测;
-    // 字节由 images::ImageCtx 的加载线程按需读取(直开/热重载共用)。
-    if mode == Mode::Image {
+    // 媒体模式(D15/D16):不读文本、不做二进制检测;字节由各模块按需读取
+    // (图片 images::ImageCtx / 音频 media::AudioCtx / 视频 video::VideoCtx / 网页 web::render)。
+    if matches!(mode, Mode::Image | Mode::Audio | Mode::Video | Mode::Web) {
         return Loaded {
             file_name: file_path.to_string(),
             content: String::new(),

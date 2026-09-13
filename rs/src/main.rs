@@ -16,10 +16,13 @@ mod images;
 mod lang;
 mod links;
 mod markdown;
+mod media;
 mod mermaid;
 mod selection;
 mod termio;
+mod video;
 mod viewport;
+mod web;
 
 use std::process::exit;
 

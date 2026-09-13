@@ -138,6 +138,21 @@ impl ImageCtx {
         self.off
     }
 
+    /// 当前终端图形协议(视频委托 mpv 时据此选 vo;D16)。
+    /// None = 未探测 / 已禁用 / 仅 halfblocks —— 视频走降级链。
+    pub fn graphics_proto(&self) -> Option<ratatui_image::picker::ProtocolType> {
+        use ratatui_image::picker::ProtocolType;
+        if self.off {
+            return None;
+        }
+        let guard = self.picker.lock().unwrap();
+        match guard.as_ref().map(|p| p.protocol_type()) {
+            Some(ProtocolType::Kitty) => Some(ProtocolType::Kitty),
+            Some(ProtocolType::Sixel) => Some(ProtocolType::Sixel),
+            _ => None,
+        }
+    }
+
     /// dirty 计数(加载/重编码完成会 +1;事件循环比对后触发重排)。
     pub fn dirty_version(&self) -> u64 {
         self.shared.dirty.load(Ordering::SeqCst)

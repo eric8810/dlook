@@ -1002,7 +1002,8 @@ fn build_lines(
                 Vec::new(),
             ),
         },
-        // 图片模式由 build_image_doc 处理,不进文本管线
-        Mode::Image => (Vec::new(), Vec::new(), Vec::new()),
+        // 媒体模式(Audio/Video/Web)的行模型由集成任务(media-4)实现;
+        // 脚手架阶段返回空行集,保证树可编译。
+        Mode::Image | Mode::Audio | Mode::Video | Mode::Web => (Vec::new(), Vec::new(), Vec::new()),
     }
 }
