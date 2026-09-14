@@ -14,6 +14,14 @@
 | B5 | 单测强度不足的三处 | `rs/src/media.rs` 测试 | ① `volume_clamp_and_mute_roundtrip` 不验证 `set_volume` 落设备 ② `reopen_replaces…` 未真触发竞态 ③ `new_is_lazy…` 的 20ms 阈值低于实测冷启动 10.8ms，不足以证明惰性 | ②③ 用更强的可观测判据（如流索引出现/消失、设备打开计数） |
 | B6 | E12 音频实验缺静音基线对照 | `docs/research/media/experiments/` | 方法本身正确（ffmpeg pulse）但无对照，结论强度低于 E9 修正版 | 补基线校验（参照修正后的 E9） |
 
+## 待修（media-3 独立验收发现，2026-09-14）
+
+| # | 问题 | 位置 | 影响 | 建议 |
+|---|---|---|---|---|
+| B7 | 自然结束后 `set_area` 被静默忽略 | `rs/src/video.rs:812-813`（要求 `child.is_some()`） | 播完后 resize，再用 `0` 重播会用旧几何 | 结束态允许记录待用几何，重播时应用 |
+| B8 | 视频媒体栏时间码在播放期间冻结 | `rs/src/termio.rs`（dlook 有意不在 mpv 活跃时写 tty） | 用户看不到进度推进（这是「不撕裂」的必要代价） | 需设计折衷：例如只在暂停/seek 时刷新，或让 mpv 自己画 OSD（`--term-status-msg`），或在安全时机节流刷新并评估撕裂风险 |
+| B9 | `set_area` 文档未就地提示重启会闪断 | `rs/src/video.rs` set_area 注释 | 集成方可能误以为无副作用 | 补一句「重启期间画面消失，调用方需全量重绘」 |
+
 ## 未覆盖的验证面（记录，不阻塞）
 
 - 真实 mp3/ogg 端到端播放（本轮只用 WAV）；64MB 上限与 10s 超时未真实触发
@@ -25,6 +33,8 @@
 
 ## 已解决（保留短记录）
 
+- **视频画面只有 320×180**（未传像素尺寸 → mpv 回退默认）→ 提交 9bf919d
+- **视频播放期间满屏乱码/撕裂**（dlook 写入插进 mpv 转义流）→ 提交 67c3581 + 42c2a34
 - `.ts` 被误判为 MPEG-TS 视频 → TypeScript 回归（提交 13ec95b）
 - 音频直开路径二次拼接（`dlook tone.wav` 报 not found）→ 提交 045da63 + `direct_src`
 - HELP 超出 24 行终端首屏 → 提交 045da63
