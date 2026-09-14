@@ -863,10 +863,11 @@ impl MediaState {
     fn toggle_mute(&self) {
         if self.audio_active {
             self.audio.toggle_mute();
+        } else if self.video_active {
+            // VideoCtx::toggle_mute 于集成期补入冻结接口(design §2 接口变更记录,
+            // 2026-09-13;实现见 task media-3)
+            self.video.toggle_mute();
         }
-        // 视频:muted 需 mpv 的 mute 属性,而 video::VideoCtx 冻结接口未暴露
-        // 静音切换(只有 adjust_volume)。为避免用 adjust_volume(0.0) 伪装静音,
-        // 这里保持无操作,接口缺口在报告里交回主 agent(design §3 `m` 对视频暂缺)。
     }
 
     fn restart(&self) {
@@ -1142,6 +1143,20 @@ enum MouseAction {
     Back,
 }
 
+/// 媒体「直开/回跳」场景的解析基准。
+///
+/// `media::AudioCtx::open(src, base_dir)` 的语义是「`src` 作为链接目标、相对 `base_dir`
+/// 解析」（`links::normalize(base_dir, src)`）。而直开（CLI 参数）与导航回跳得到的
+/// `nav.path` 本身已经是「相对 cwd 或绝对」的路径，若再传其所在目录会二次拼接
+/// （`test/fixtures/audio/tone.wav` → `test/fixtures/audio/test/fixtures/audio/tone.wav`
+/// → `✗ not found`）。空 base 让 `normalize` 原样返回 = 相对 cwd 解析。
+///
+/// M2（点击 markdown 内的音频链接）走的仍是链接语义，基准必须是当前文档目录，
+/// 见 `open_link`（不经过本函数）。
+fn direct_base() -> &'static Path {
+    Path::new("")
+}
+
 /// 当前文件所在目录(相对图片/链接按它解析)。
 fn base_dir_of(path: &str) -> PathBuf {
     Path::new(path)
@@ -1198,7 +1213,8 @@ fn event_loop(
     // 媒体模式(D16):进入即启动会话(音频 open / 视频 start / 网页后台 render)。
     match nav.mode {
         Mode::Audio => {
-            media.start_audio(&nav.path, &base_dir_of(&nav.path));
+            // 直开：nav.path 已是 cwd 相对/绝对路径 → 空 base，避免二次拼接（见 direct_base）
+            media.start_audio(&nav.path, direct_base());
         }
         Mode::Video => {
             let (w, h) = current_size(terminal);
@@ -1535,7 +1551,8 @@ fn retarget_media(
 ) {
     match nav.mode {
         Mode::Audio => {
-            media.start_audio(&nav.path, &base_dir_of(&nav.path));
+            // 直开：nav.path 已是 cwd 相对/绝对路径 → 空 base，避免二次拼接（见 direct_base）
+            media.start_audio(&nav.path, direct_base());
         }
         Mode::Video => {
             let (w, h) = current_size(terminal);
@@ -2606,6 +2623,29 @@ mod tests {
         assert_eq!((a.left, a.top, a.cols, a.rows), (1, 1, 78, 20));
         let b = video_area_for(40, 6, 1);
         assert_eq!((b.left, b.top, b.cols, b.rows), (1, 1, 38, 3));
+    }
+
+    /// 直开路径不再二次拼接（回归 bug：`dlook test/fixtures/audio/tone.wav`
+    /// 显示 `✗ not found`，因为直开时把路径所在目录又当成了链接基准）。
+    #[test]
+    fn direct_open_base_does_not_double_join() {
+        let src = "test/fixtures/audio/tone.wav";
+        // 直开：空 base → 原路径（相对 cwd 解析）
+        assert_eq!(links::normalize(direct_base(), src), Path::new(src));
+        // M2 链接场景：文档目录 + 链接目标 → 正常拼接
+        assert_eq!(
+            links::normalize(Path::new("test/fixtures"), "audio/tone.wav"),
+            Path::new(src)
+        );
+        // 锁死错误形态：传所在目录会得到重复段（旧实现的症状）
+        let buggy = links::normalize(Path::new("test/fixtures/audio"), src);
+        assert_ne!(buggy, Path::new(src));
+        assert_eq!(buggy.to_string_lossy().matches("test/fixtures/audio").count(), 2);
+        // 绝对路径不受 base 影响
+        assert_eq!(
+            links::normalize(direct_base(), "/tmp/tone.wav"),
+            Path::new("/tmp/tone.wav")
+        );
     }
 
     #[test]

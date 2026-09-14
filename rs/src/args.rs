@@ -13,38 +13,20 @@ pub const VERSION: &str = concat!("dlook ", env!("CARGO_PKG_VERSION"));
 
 pub const HELP: &str = "\
 dlook — a minimal terminal file previewer
-
 Usage:
-  dlook <file>        Preview a file: markdown / code / mermaid / image /
-                      audio / video / web page (http(s) URL or local .html)
-  dlook --help, -h    Show this help
-  dlook --version, -V Show version
-
-Keys (pager):
-  q / Esc            Quit
-  j / k              Scroll down / up one line
-  Space / PageDown   Scroll down one page
-  PageUp             Scroll up one page
-  g / G              Go to top / bottom
-  Arrow Up/Down      Scroll one line
-  Home / End         Go to top / bottom
-  Ctrl+C             Quit (exit 130)
-  ⌫ / Alt+←          Back (previous file)
-  drag / y           Copy selection (OSC 52)
-
-Keys (media: audio/video M1, audio link in a document M2):
-  Space              Play/pause (M1) — in M2 Space still scrolls a page
-  p                  Play/pause
-  ← / →              Seek ∓5s (Shift: ∓1s);  , / . : ∓60s
-  - / +              Volume ∓5%;  m: mute;  0: restart
-  o                  Open the current web page in a browser (web mode only)
-  Esc                Clear selection → stop the session → quit
-  ⌫ / q / Ctrl+C     Stop the session and go back / quit
-
-Notes:
-  - Audio/video/web need a terminal; piping them errors with exit 1.
-  - Media sessions do not participate in hot reload: editing a playing file
-    does not interrupt playback, and web pages are not re-fetched.
+  dlook <file>             Preview markdown / code / mermaid / image / audio /
+                           video / web page (http(s) URL or local .html)
+  dlook --help, -h         Show this help · --version, -V: show version
+Pager keys:  q/Esc quit · j/k ↑↓ scroll · Space/PgDn PgUp page · g/G Home/End
+             ⌫/Alt+← back · drag or y copy selection (OSC 52) · Ctrl+C quit (130)
+Media keys (M1 = audio/video file · M2 = audio link inside a document):
+  Space  play/pause in M1 — in M2 Space still pages, use p
+  ←/→  seek ∓5s (Shift ∓1s) · ,/. ∓60s · -/+ volume ∓5% · m mute · 0 restart
+  o  open the current web page in a browser (web mode only)
+  Esc  clear selection → stop the session → quit · ⌫/q: stop and return
+Media bar mouse:  progress click=seek drag=scrub wheel=∓5s · info click=play/pause
+                  right end wheel=volume click=mute · middle click=back
+Notes: audio/video/web need a terminal (piping exits 1); media skips hot reload.
 ";
 
 pub struct ParsedArgs {
