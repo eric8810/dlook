@@ -505,6 +505,9 @@ struct MediaState {
     probe_text: Option<String>,
     /// 视频降级原因（信息行/状态栏文案）。
     degrade_reason: String,
+    /// 视频会话生命周期相位（0 Loading/1 播放或暂停/2 结束/3 失败/255 无会话）。
+    /// 只在相位变化时清屏重绘，避免打断 mpv 的图像流（见 video_lifecycle_changed）。
+    video_phase: u8,
 }
 
 impl MediaState {
@@ -526,6 +529,7 @@ impl MediaState {
             probe_deadline: None,
             probe_text: None,
             degrade_reason: String::new(),
+            video_phase: 255,
         }
     }
 
@@ -623,6 +627,7 @@ impl MediaState {
                     Ok(()) => {
                         self.video_active = true;
                         self.video_dirty = self.video.dirty_version();
+                        self.video_phase = 0; // Loading → 启动后需一次全量重绘
                         self.input.video = VideoBody::Empty;
                         true
                     }
@@ -727,6 +732,7 @@ impl MediaState {
         }
         self.video.stop();
         self.video_active = false;
+        self.video_phase = 255;
         let src = self.video_src.take().unwrap_or_else(|| "-".to_string());
         self.input.video = VideoBody::Info(vec![Line::default().spans(vec![Span::styled(
             format!("■ playback stopped: {src}"),
@@ -787,6 +793,9 @@ impl MediaState {
     }
 
     /// 轮询引擎 dirty 计数（加载/失败/结束等异步事件）；true = 需要重建 Doc。
+    ///
+    /// 视频的 `dirty_version()` 在**每次状态刷新**都会变（位置推进也计入），因此这里
+    /// 返回的「变了」多半只是时间码刷新，不代表需要全量重绘。
     fn poll_dirty(&mut self) -> bool {
         let mut changed = false;
         if self.audio_active {
@@ -806,6 +815,35 @@ impl MediaState {
             }
         }
         changed
+    }
+
+    /// 视频会话层是否发生了「生命周期」变化（启动/就绪/结束/失败/停止）。
+    ///
+    /// 只有这种变化才需要 `terminal.clear()` 全量重绘（design §5.4：mpv 启动与退出都会
+    /// 发 `\033_Ga=d` 清空终端图像）。**绝不能按 dirty 每次清屏**：dirty 含位置刷新，
+    /// 而在 mpv 正输出 sixel/kitty 流时写清屏序列会截断它的转义流，终端把剩余载荷当
+    /// 文本打印 → 满屏乱码并覆盖 chrome（V 套件实测：暂停/seek 后画面撕裂）。
+    fn video_lifecycle_changed(&self) -> bool {
+        self.video_phase_now() != self.video_phase
+    }
+
+    /// 当前相位读数（无会话 = 255）。
+    fn video_phase_now(&self) -> u8 {
+        if !self.video_active {
+            return 255;
+        }
+        match self.video.snapshot().map(|s| s.status) {
+            None => 255,
+            Some(VideoStatus::Loading) => 0,
+            Some(VideoStatus::Playing | VideoStatus::Paused) => 1,
+            Some(VideoStatus::Finished) => 2,
+            Some(VideoStatus::Failed(_)) => 3,
+        }
+    }
+
+    /// 记录当前相位（清屏之后调用）。
+    fn sync_video_phase(&mut self) {
+        self.video_phase = self.video_phase_now();
     }
 
     /// 刷新 Mode::Audio 的 body 信息块。
@@ -1439,10 +1477,14 @@ fn event_loop(
         }
 
         // 媒体异步事件:音频/视频 dirty(加载完成/失败/结束) → 重建 Doc。
-        // 视频状态变化(进入/就绪/退出)伴随 mpv 清屏 → 全量重绘(design §5.4)。
+        // 视频**只在生命周期相位变化时**清屏全量重绘(design §5.4:mpv 启动/退出会发
+        // `\033_Ga=d` 清空终端图像);若按 dirty 每次清屏,会截断 mpv 在途的
+        // sixel/kitty 流 —— 终端把残余载荷当文本打印 → 满屏乱码并覆盖 chrome
+        // (V 套件实测:暂停/seek 之后画面撕裂)。
         if media.poll_dirty() {
             ui.sel = None;
-            if media.video_active {
+            if media.video_lifecycle_changed() {
+                media.sync_video_phase();
                 let _ = terminal.clear();
             }
             rebuild_media_doc(terminal, doc, &mut ui, &nav, &content, hl, skin, img_ctx, &media);
@@ -2674,6 +2716,19 @@ mod tests {
             links::normalize(direct_base(), "/tmp/tone.wav"),
             Path::new("/tmp/tone.wav")
         );
+    }
+
+    /// 只应在视频生命周期相位变化时清屏（全量重绘）。
+    /// 回归:早期实现按 dirty 每次 `terminal.clear()` —— dirty 含位置刷新,清屏序列会
+    /// 插进 mpv 在途的 sixel/kitty 流,终端把残余载荷当文本打印(V 套件实测满屏乱码
+    /// 并覆盖 chrome)。video.rs 落地前 snapshot() 不可调用,故此处只锁相位读数与
+    /// 「同相位不算变化」的判据。
+    #[test]
+    fn video_clear_only_on_lifecycle_change() {
+        let m = MediaState::new();
+        assert_eq!(m.video_phase_now(), 255, "无会话相位 = 255");
+        assert!(!m.video_lifecycle_changed(), "无会话不得触发清屏");
+        assert_ne!(0u8, m.video_phase, "初始相位与 Loading(0) 不同 → 启动即需一次清屏");
     }
 
     /// 降级链中间层（无 mpv/无协议 → ffmpeg 抽首帧 → 既有图片管线）的真实能力：
