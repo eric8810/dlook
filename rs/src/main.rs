@@ -34,6 +34,15 @@ fn main() {
 
     // 非 TTY（管道重定向）：pager 无意义 → 直出
     if !termio::is_tty() {
+        // 媒体模式(音频/视频/网页)需要终端:播放、图形协议、鼠标交互都依赖 TTY
+        // (design §4 非 TTY)。
+        if matches!(
+            loaded.mode,
+            lang::Mode::Audio | lang::Mode::Video | lang::Mode::Web
+        ) {
+            eprintln!("error: '{}' needs a terminal", parsed.file);
+            exit(1);
+        }
         // 图片无法在管道中渲染(图形协议需要 TTY)
         if loaded.mode == lang::Mode::Image {
             eprintln!(

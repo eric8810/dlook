@@ -132,6 +132,13 @@ pub fn is_image_ext(file_name: &str) -> bool {
     }
 }
 
+/// http(s) URL 的最后一个路径段(去 query/fragment),供扩展名判定复用。
+pub fn url_last_segment(url: &str) -> String {
+    let no_frag = url.split('#').next().unwrap_or(url);
+    let no_query = no_frag.split('?').next().unwrap_or(no_frag);
+    no_query.rsplit('/').next().unwrap_or(no_query).to_string()
+}
+
 /// 是否为音频扩展名(DECISIONS D16)。
 /// 注意:opus 在 symphonia 无解码器(上游未发布),仍归入 Audio 由播放层给出明确错误。
 pub fn is_audio_ext(file_name: &str) -> bool {
@@ -177,8 +184,19 @@ pub fn is_web_ext(file_name: &str) -> bool {
 
 /// 判定预览模式 + 语法 token。
 pub fn detect_mode_lang(file_name: &str) -> (Mode, Option<&'static str>) {
-    // http(s) URL(D16): 网页预览,不按扩展名判定
+    // http(s) URL(D16):默认网页预览;但 URL 路径扩展名明确指向音频/视频/图片时
+    // 交给对应模块(引擎支持远程源:音频下载后播放、图片直接 fetch、视频交 mpv)。
     if file_name.starts_with("http://") || file_name.starts_with("https://") {
+        let name = url_last_segment(file_name);
+        if is_audio_ext(&name) {
+            return (Mode::Audio, None);
+        }
+        if is_video_ext(&name) {
+            return (Mode::Video, None);
+        }
+        if is_image_ext(&name) {
+            return (Mode::Image, None);
+        }
         return (Mode::Web, None);
     }
     if is_markdown_ext(file_name) {

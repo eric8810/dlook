@@ -35,8 +35,9 @@ fn fail(msg: &str) -> ! {
 pub fn load_content(file_path: &str) -> Loaded {
     let (mode, syntax_token) = detect_mode_lang(file_path);
 
-    // 网页 URL(D16): 无本地文件,内容由 web 模块抓取
-    if mode == Mode::Web && (file_path.starts_with("http://") || file_path.starts_with("https://")) {
+    // 远程 URL(D16):无本地文件,字节由 web::render / AudioCtx(下载)/ ImageCtx(fetch)
+    // 各自获取;此处不做任何文件系统访问。
+    if file_path.starts_with("http://") || file_path.starts_with("https://") {
         return Loaded {
             file_name: file_path.to_string(),
             content: String::new(),

@@ -71,6 +71,33 @@ Screen.scroll_down = _scroll_down
 Stream.csi["S"] = "scroll_up"
 Stream.csi["T"] = "scroll_down"
 
+# pyte 0.8.x `display` raises IndexError when a wide-char stub cell ("") is left
+# orphaned — which happens whenever a renderer writes a single-width cell over the
+# first half of a CJK/wide glyph (ratatui does this when a media bar row is
+# replaced by body text). Real terminals show a space in the stub column; mirror
+# that instead of crashing the harness.
+from wcwidth import wcwidth as _wcwidth  # noqa: E402
+
+
+def _display(self):
+    def render(line):
+        is_wide = False
+        for x in range(self.columns):
+            if is_wide:  # skip stub column of a wide glyph
+                is_wide = False
+                continue
+            char = line[x].data
+            if not char:
+                yield " "
+                continue
+            is_wide = _wcwidth(char[0]) == 2
+            yield char
+
+    return ["".join(render(self.buffer[y])) for y in range(self.lines)]
+
+
+Screen.display = property(_display)
+
 
 # pyte 0.8.x has no alternate-screen buffer support (modes 47/1047/1049).
 # Patch set_mode / reset_mode to swap self.buffer between main and alt.

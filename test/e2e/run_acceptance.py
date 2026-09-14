@@ -10,6 +10,12 @@ import os
 import sys
 import subprocess
 import time
+import functools
+import http.server
+import re
+import shutil
+import tempfile
+import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
 from pty_harness import PtySession, run_shell  # noqa: E402
@@ -676,19 +682,1014 @@ def main():
     if not os.path.exists(lg):
         subprocess.run(["bash", os.path.join(ROOT, "test/e2e/gen-large.sh")], check=True)
 
-    for sc in [scenario_A, scenario_B, scenario_C, scenario_D,
-               scenario_E, scenario_F, scenario_G, scenario_H, scenario_I,
-               scenario_J, scenario_K, scenario_L, scenario_M, scenario_N]:
+    scenarios = {
+        "A": scenario_A, "B": scenario_B, "C": scenario_C, "D": scenario_D,
+        "E": scenario_E, "F": scenario_F, "G": scenario_G, "H": scenario_H,
+        "I": scenario_I, "J": scenario_J, "K": scenario_K, "L": scenario_L,
+        "M": scenario_M, "N": scenario_N,
+        # 媒体套件(task media-4)
+        "O": scenario_O, "OE9": scenario_O_e9,
+        "P": scenario_P, "Q": scenario_Q, "R": scenario_R,
+    }
+    # 可选场景过滤:python3 run_acceptance.py A B O R(默认全部)
+    want = [a.upper() for a in sys.argv[1:]]
+    for name, fn in scenarios.items():
+        if want and name not in want:
+            continue
         try:
-            sc()
+            fn()
         except Exception as ex:
-            print(f"  \u2717 {sc.__name__} EXCEPTION: {ex}")
+            print(f"  \u2717 {fn.__name__} EXCEPTION: {ex}")
             global FAIL
             FAIL += 1
 
     print()
-    print(f"RESULT: PASS={PASS} FAIL={FAIL}")
+    print(f"RESULT: PASS={PASS} FAIL={FAIL} SKIP={SKIP}")
     sys.exit(0 if FAIL == 0 else 1)
+
+
+# ==========================================================================
+# 媒体套件(task media-4 / design §6):O 音频 / P 视频 / Q 网页 / R 交互。
+#
+# 断言口径:
+#   - 播放依赖的断言在无音频设备时**显式跳过**(打印 ⊘ SKIP 标记),不伪装通过
+#     (design §6 O 场景、任务书 §E)。
+#   - 视频 mpv 共屏路径需要真实图形协议;pty+pyte 无协议 → 走降级链断言,
+#     mpv 路径在 test/e2e/run-visual.sh(V 套件,foot 真实终端)覆盖。
+#   - 引擎模块未落地(todo!())时进程 panic 退出 101:检测到 → 显式 SKIP 并标注
+#     「待引擎落地」。
+# ==========================================================================
+
+SKIP = 0
+
+# 三套引擎的 panic 特征(任务书:引擎未落地时 E2E 待跑)
+_ENGINE_PANIC = {
+    "media-1": "media.rs",
+    "media-2": "web.rs",
+    "media-3": "video.rs",
+}
+
+
+def skip(desc, reason):
+    global SKIP
+    SKIP += 1
+    print(f"  \u2298 {desc}  (SKIP: {reason})")
+
+
+def panic_engine(s):
+    """进程因引擎 todo!() panic 时返回引擎任务号,否则 None。"""
+    if s.wait_exit(0.4) != 101:
+        return None
+    raw = s.raw_text()
+    for task, file in _ENGINE_PANIC.items():
+        if f"src/{file}" in raw and "not yet implemented" in raw:
+            return task
+    return None
+
+
+def engine_skip(desc, task):
+    skip(desc, f"待引擎落地({task} 仍为 todo!() → 进程 panic 101)")
+
+
+# ---- 媒体栏定位/解析 helpers ------------------------------------------------
+
+def progress_row(s):
+    """媒体栏进度条行(1-based);无媒体栏返回 None。"""
+    rows = s.lines()
+    for i in range(len(rows), max(0, len(rows) - 4), -1):
+        line = rows[i - 1]
+        if re.search(r"\d\d:\d\d / (--:--|\d\d:\d\d)", line) and (
+            "\u2501" in line or "\u2500" in line
+        ):
+            return i
+    return None
+
+
+def info_row(s):
+    p = progress_row(s)
+    if p is None or p + 1 > len(s.lines()):
+        return None
+    return p + 1
+
+
+def timecodes(s):
+    """(位置秒, 时长秒|None);无媒体栏返回 (None, None)。"""
+    p = progress_row(s)
+    if p is None:
+        return (None, None)
+    m = re.search(r"(\d\d:\d\d) / (--:--|\d\d:\d\d)", s.row(p))
+    if not m:
+        return (None, None)
+
+    def secs(t):
+        if t == "--:--":
+            return None
+        mm, ss = t.split(":")
+        return int(mm) * 60 + int(ss)
+
+    return (secs(m.group(1)), secs(m.group(2)))
+
+
+def bar_fraction(s):
+    """进度条实心比例(0..1);无进度条返回 None。"""
+    p = progress_row(s)
+    if p is None:
+        return None
+    seg = s.row(p).split("  ")[0]
+    filled = seg.count("\u2501")
+    total = filled + seg.count("\u2500")
+    return filled / total if total else None
+
+
+def bar_error(s):
+    """媒体栏降级态(`✗ <原因>`)文案;正常返回 None。"""
+    p = progress_row(s)
+    if p is None:
+        return None
+    cand = [s.row(p + 1)] if p + 1 <= len(s.lines()) else []
+    cand += list(s.lines()[1:4])
+    for line in cand:
+        if "✗" in line:
+            return line.strip()
+    return None
+
+
+def require_playback(s, desc):
+    """播放依赖断言的前置检查:无设备/解码失败 → 显式 SKIP 并返回 False。"""
+    err = bar_error(s)
+    if err:
+        skip(desc, f"无音频设备 / 解码失败 → {err[:48]}")
+        return False
+    return True
+
+
+def _click(s, col, row, settle=0.4):
+    """在 (col,row) 注入左键按下+松开(SGR 鼠标序列;1-based)。"""
+    s.send(_sgr("M", 0, col, row))
+    s.feed(0.12)
+    s.send(_sgr("m", 0, col, row))
+    s.feed(settle)
+
+
+def _wheel(s, up, col, row, settle=0.4):
+    s.send(_sgr("M", 64 if up else 65, col, row))
+    s.feed(settle)
+
+
+def _mid_click(s, col, row, settle=0.5):
+    s.send(_sgr("M", 1, col, row))
+    s.feed(0.12)
+    s.send(_sgr("m", 1, col, row))
+    s.feed(settle)
+
+
+def progress_cells(s):
+    """(进度条首列, 宽度) 1-based 列号;无进度条返回 None。"""
+    p = progress_row(s)
+    if p is None:
+        return None
+    start = None
+    width = 0
+    for i, ch in enumerate(s.row(p)):
+        if ch in ("\u2501", "\u2500"):
+            if start is None:
+                start = i + 1
+            width += 1
+        elif start is not None:
+            break
+    return (start, width) if start is not None else None
+
+
+def media_env(**kw):
+    return dict(os.environ, DLOOK_IMAGE_PROTOCOL="halfblocks", **kw)
+
+
+def ensure_audio_fixture():
+    """生成确定性 WAV(8s 440Hz 单声道 8kHz);不落库二进制,按需生成。"""
+    path = os.path.join(FIX, "audio", "tone.wav")
+    if os.path.exists(path):
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    import math
+    import struct
+    import wave
+
+    with wave.open(path, "w") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(8000)
+        frames = b"".join(
+            struct.pack("<h", int(12000 * math.sin(2 * math.pi * 440 * i / 8000)))
+            for i in range(8000 * 8)
+        )
+        w.writeframes(frames)
+    return path
+
+
+# ---- O. 音频(design §6:O1–O12 + O13 降级 / O14 非 TTY) --------------------
+
+def scenario_O():
+    print("== O-audio ==")
+    wav = ensure_audio_fixture()
+    env = media_env()
+    md_audio = os.path.join(FIX, "md-audio.md")
+
+    # O1: M1 直接打开 → 媒体栏(进度条+时间码)+ 媒体 footer + body 信息块
+    s = PtySession(BIN + [wav], cols=80, rows=24, env=env, cwd=ROOT)
+    s.start()
+    s.feed(1.2)
+    task = panic_engine(s)
+    if task:
+        engine_skip("O1–O14 音频场景", task)
+        s.close()
+        return
+    p = progress_row(s)
+    check(p == 22, "O1 媒体栏进度条行 = rows-2 (22)", f"got {p}")
+    check(timecodes(s)[1] == 8, "O1 时间码显示时长 00:08", str(timecodes(s)))
+    check(
+        "space" in s.row(24) and "\u23ef" in s.row(24),
+        "O1 footer 分层 M1(整体替换媒体键位)",
+        s.row(24)[:40],
+    )
+    body = s.screen_text()
+    check("tone.wav" in body and "format:" in body, "O1 body 信息块(标题/格式)")
+    check(s.row(1).endswith("tone.wav"), "O1 header 显示文件名", s.row(1))
+    playing_ok = require_playback(s, "O2 时间码推进")
+
+    if playing_ok:
+        t0 = timecodes(s)[0]
+        f0 = bar_fraction(s)
+        s.feed(2.2)
+        t1 = timecodes(s)[0]
+        f1 = bar_fraction(s)
+        check(t1 is not None and t0 is not None and t1 > t0, f"O2 时间码推进 {t0}→{t1}")
+        check(
+            f1 is not None and f0 is not None and f1 >= f0,
+            f"O2 进度条比例不倒退 {f0}→{f1}",
+        )
+
+        # O3: `p` 暂停 → ▮▮ + 时间码冻结
+        s.send_key("p")
+        s.feed(0.6)
+        ir = info_row(s)
+        check("\u25ae\u25ae" in (s.row(ir) if ir else ""), "O3 暂停图标 ▮▮")
+        tp = timecodes(s)[0]
+        s.feed(1.2)
+        check(timecodes(s)[0] == tp, f"O3 暂停时时间码冻结({tp})")
+
+        # O4: Space 在 M1 恢复播放
+        s.send_key("Space")
+        s.feed(1.0)
+        ir = info_row(s)
+        check("\u25b6" in (s.row(ir) if ir else ""), "O4 Space(M1) 恢复播放(▶)")
+        check(
+            timecodes(s)[0] is not None and timecodes(s)[0] > tp,
+            "O4 时间码继续推进",
+        )
+
+        # O5: seek 跳变(→ +5s / `,` -60s clamp / `.` +60s clamp)
+        # 先暂停:曲末自然结束(finished)后 seek 被引擎忽略(见报告:media-1 观察项)
+        s.send_key("p")
+        s.feed(0.4)
+        p0 = timecodes(s)[0]
+        s.send_key(",")
+        s.feed(0.5)
+        check(timecodes(s)[0] == 0, f"O5 `,` -60s clamp 00:00 (from {p0})")
+        s.send_key(".")
+        s.feed(0.5)
+        check(timecodes(s)[0] == 8, f"O5 `.` +60s clamp 末尾 (got {timecodes(s)[0]})")
+        s.send_key(",")
+        s.feed(0.5)
+        s.send_key("Right")
+        s.feed(0.5)
+        check(timecodes(s)[0] == 5, f"O5 → seek +5s (got {timecodes(s)[0]})")
+        check("seek +5s" in s.screen_text(), "O5 状态栏 seek 反馈")
+        s.send_key("Left")
+        s.feed(0.5)
+        check(timecodes(s)[0] == 0, f"O5 ← seek -5s (got {timecodes(s)[0]})")
+        s.send_key("p")
+        s.feed(0.4)
+
+        # O6: 音量 -/+(栏内百分比 + 状态栏)
+        s.send_key("-")
+        s.feed(0.5)
+        check("vol " in s.screen_text(), "O6 音量状态栏反馈")
+        ir = info_row(s)
+        low = re.search(r"(\d+)%", s.row(ir) if ir else "")
+        s.send_key("+")
+        s.feed(0.5)
+        ir = info_row(s)
+        high = re.search(r"(\d+)%", s.row(ir) if ir else "")
+        check(
+            low is not None and high is not None and int(high.group(1)) > int(low.group(1)),
+            f"O6 -/+ 音量 ±5% ({low and low.group(0)} → {high and high.group(0)})",
+        )
+
+        # O7: `m` 静音切换
+        s.send_key("m")
+        s.feed(0.5)
+        ir = info_row(s)
+        check("mute" in (s.row(ir) if ir else ""), "O7 静音后栏内 mute")
+        check("muted" in s.screen_text(), "O7 状态栏 muted")
+        s.send_key("m")
+        s.feed(0.5)
+        ir = info_row(s)
+        check("mute" not in (s.row(ir) if ir else ""), "O7 再按解除静音")
+
+        # O8: `0` 回曲首
+        s.send_key("0")
+        s.feed(0.6)
+        check(
+            timecodes(s)[0] is not None and timecodes(s)[0] <= 1,
+            f"O8 0 → 回曲首 (got {timecodes(s)[0]})",
+        )
+        check("restart" in s.screen_text(), "O8 状态栏 restart")
+
+    # O9: Esc 链(清选区 → 停止会话 → 退出)
+    s.send_key("Escape")
+    s.feed(0.6)
+    check(s.wait_exit(0.3) is None, "O9 Esc① 停止会话不退出")
+    check(progress_row(s) is None, "O9 停止后媒体栏隐藏")
+    check("stopped" in s.screen_text(), "O9 状态栏 stopped")
+    s.feed(1.8)  # 等状态消息过期(1.5s TTL)→ footer 回落普通键位
+    check("q quit" in s.row(24), "O9 footer 回到 pager 键位", s.row(24)[:30])
+    s.send_key("Escape")
+    code = s.wait_exit(3)
+    check(code == 0, f"O9 Esc② 退出码 0 (got {code})")
+    s.close()
+
+    # O10/O11: M2 —— markdown 内点击音频链接就地播放(不导航)
+    s = PtySession(BIN + [md_audio], cols=80, rows=24, env=env, cwd=ROOT)
+    s.start()
+    s.feed(0.8)
+    before_header = s.row(1)
+    cell = _find_cell(s, "click tone")
+    check(cell is not None, "O10 找到音频链接 cell")
+    if cell:
+        _click(s, *cell, settle=0.9)
+        check(s.row(1) == before_header, "O10 M2 就地播放不导航", s.row(1)[:40])
+        check(progress_row(s) is not None, "O10 M2 媒体栏出现")
+        row2 = s.row(2)
+        s.send_key("Space")
+        s.feed(0.5)
+        check(s.row(2) != row2, "O10 M2 Space 仍翻页", f"{row2!r} → {s.row(2)!r}")
+        check(progress_row(s) is not None, "O10 翻页后会话仍在")
+        s.feed(1.8)
+        s.send_key("j")
+        s.feed(0.3)
+        check(
+            "\u266a" in s.row(24) and "p \u23ef" in s.row(24),
+            "O10 M2 footer 追加 ♪ p ⏯",
+            s.row(24)[-20:],
+        )
+        check("space/pgdn" in s.row(24), "O10 M2 保留原 pager 键位", s.row(24)[:30])
+
+        # O11: M2 `p` 暂停
+        if require_playback(s, "O11 M2 p 暂停"):
+            s.send_key("p")
+            s.feed(0.6)
+            ir = info_row(s)
+            check("\u25ae\u25ae" in (s.row(ir) if ir else ""), "O11 M2 p 暂停(▮▮)")
+            s.send_key("p")
+            s.feed(0.5)
+    s.send_key("q")
+    code = s.wait_exit(3)
+    check(code == 0, f"O11 M2 q 退出 0 (got {code})")
+    s.close()
+
+    # O12: 远程 URL 音频(本地 http server,避免外网依赖)
+    handler = functools.partial(
+        http.server.SimpleHTTPRequestHandler, directory=os.path.dirname(wav)
+    )
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{port}/{os.path.basename(wav)}"
+    s = PtySession(BIN + [url], cols=80, rows=24, env=env, cwd=ROOT)
+    s.start()
+    s.feed(2.5)
+    task = panic_engine(s)
+    if task:
+        engine_skip("O12 远程 URL 音频", task)
+    else:
+        check(progress_row(s) is not None, "O12 远程 URL 媒体栏出现")
+        check(timecodes(s)[1] == 8, f"O12 远程 URL 时长 00:08 (got {timecodes(s)})")
+        s.send_key("q")
+        code = s.wait_exit(3)
+        check(code == 0, f"O12 远程 URL q 退出 0 (got {code})")
+    s.close()
+    srv.shutdown()
+
+    # O13: 降级链 —— 解码失败(伪 mp3)→ 栏内 ✗ <原因> + body 提示行,不退出
+    bogus = os.path.join(tempfile.gettempdir(), "dlook-e2e-bogus.mp3")
+    with open(bogus, "w") as f:
+        f.write("not audio at all\n" * 20)
+    s = PtySession(BIN + [bogus], cols=80, rows=24, env=env, cwd=ROOT)
+    s.start()
+    s.feed(1.5)
+    task = panic_engine(s)
+    if task:
+        engine_skip("O13 音频降级链", task)
+    else:
+        check(progress_row(s) is not None, "O13 失败态仍显示媒体栏")
+        err = bar_error(s)
+        check(err is not None, "O13 栏内 ✗ <原因>", str(err))
+        check("\u2717" in s.screen_text(), "O13 body 提示 ✗ 原因")
+        check(s.wait_exit(0.3) is None, "O13 失败不退出进程")
+        s.send_key("q")
+        code = s.wait_exit(3)
+        check(code == 0, f"O13 失败态 q 退出 0 (got {code})")
+    s.close()
+
+    # O14: 非 TTY(管道)→ error: '<arg>' needs a terminal + rc 1
+    r = subprocess.run(BIN + [wav], capture_output=True, text=True, cwd=ROOT, env=env)
+    check(r.returncode == 1, f"O14 非 TTY 音频 rc 1 (got {r.returncode})")
+    check("needs a terminal" in r.stderr, "O14 非 TTY 报错文案", r.stderr.strip()[:60])
+
+
+def scenario_O_e9():
+    """E9 探针:证明样本真的到达设备(null sink + monitor 录制)。
+
+    默认跳过(需 pactl/pw-record 且显式 DLOOK_E2E_E9=1);跳过分支显式标记。
+    """
+    print("== O-e9 (audio probe) ==")
+    if os.environ.get("DLOOK_E2E_E9") != "1":
+        skip("O-E9 null-sink 录制探针", "未启用(DLOOK_E2E_E9=1 时运行;需 pactl+pw-record)")
+        return
+    tools = {t: shutil.which(t) for t in ("pactl", "pw-record")}
+    if not all(tools.values()):
+        skip("O-E9 null-sink 录制探针", f"缺少工具 {[k for k, v in tools.items() if not v]}")
+        return
+    wav = ensure_audio_fixture()
+    log = os.path.join(tempfile.gettempdir(), "dlook-e9-rec.wav")
+    subprocess.run(
+        [tools["pactl"], "load-module", "module-null-sink", "sink_name=dlook-e2e"],
+        check=False, capture_output=True,
+    )
+    rec = subprocess.Popen(
+        [tools["pw-record"], "--target", "dlook-e2e.monitor", "--channels", "2",
+         "--rate", "44100", log],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(0.4)
+    s = PtySession(BIN + [wav], cols=80, rows=24, env=media_env(PULSE_SINK="dlook-e2e"), cwd=ROOT)
+    s.start()
+    s.feed(2.5)
+    s.send_key("q")
+    s.wait_exit(3)
+    s.close()
+    rec.terminate()
+    time.sleep(0.3)
+    subprocess.run([tools["pactl"], "unload-module", "module-null-sink"], check=False,
+                   capture_output=True)
+    try:
+        import math
+        import struct
+        import wave as wave_mod
+
+        with wave_mod.open(log) as w:
+            frames = w.readframes(w.getnframes())
+            ch = w.getnchannels() or 1
+        samples = struct.unpack(f"<{len(frames)//2}h", frames)[::ch]
+        rms = math.sqrt(sum(v * v for v in samples) / max(1, len(samples)))
+        check(rms > 100, f"O-E9 探针捕获到非静音样本 (RMS={rms:.0f})")
+    except Exception as ex:  # noqa: BLE001
+        skip("O-E9 探针读回", f"录制文件不可读: {ex}")
+
+
+# ---- P. 视频(design §6:P1–P8) ---------------------------------------------
+# pty+pyte 无图形协议 → mpv 共屏路径(P1–P4)无法在 pty 内成立:这些用例检查
+# mpv 路径的**前置条件**,不成立时显式 SKIP 并指向 V 套件(真实终端)。
+# P5–P8 走降级链,pty 内可完整断言(引擎落地后)。
+
+def _children_of(pid):
+    """某进程的直接子进程 pid 列表(/proc 扫描,无 psutil 依赖)。"""
+    out = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                fields = f.read().split()
+            if len(fields) > 3 and int(fields[3]) == pid:
+                out.append(int(entry))
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def _child_cmdlines(pid):
+    cmds = []
+    for c in _children_of(pid):
+        try:
+            with open(f"/proc/{c}/cmdline", "rb") as f:
+                cmds.append(f.read().replace(b"\0", b" ").decode(errors="replace").strip())
+        except OSError:
+            continue
+    return cmds
+
+
+def _video_fixture():
+    """生成 4s 测试视频(ffmpeg;缺 ffmpeg 时用 experiments 里的样例)。"""
+    path = os.path.join(FIX, "video", "clip.mp4")
+    if os.path.exists(path):
+        return path
+    if shutil.which("ffmpeg"):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+             "testsrc=duration=4:size=320x180:rate=10", "-pix_fmt", "yuv420p", path],
+            check=False, capture_output=True,
+        )
+        if os.path.exists(path):
+            return path
+    alt = os.path.join(ROOT, "docs/research/media/experiments/test-video.mp4")
+    return alt if os.path.exists(alt) else None
+
+
+def _path_without(*progs):
+    """PATH 去掉指定可执行所在目录(用于模拟 mpv/ffmpeg 缺失)。"""
+    drop_dirs = set()
+    for p in progs:
+        loc = shutil.which(p)
+        if loc:
+            drop_dirs.add(os.path.dirname(loc))
+    keep = [d for d in os.environ.get("PATH", "").split(os.pathsep)
+            if d and d not in drop_dirs]
+    return os.pathsep.join(keep)
+
+
+def scenario_P():
+    print("== P-video ==")
+    clip = _video_fixture()
+    if clip is None:
+        skip("P1–P8 视频场景", "无测试视频(缺 ffmpeg 且 experiments 样例不存在)")
+        return
+
+    # P1/P2: mpv 启动(四态)+ IPC 控制链 —— 需真实图形协议
+    if os.environ.get("DLOOK_REAL_TERM") == "1":
+        _scenario_P_real(clip)
+    else:
+        skip("P1 mpv spawn 参数(/proc/<pid>/cmdline)",
+             "pty+pyte 无图形协议 → 走降级链;真实终端(sway/foot)覆盖于 V 套件")
+        skip("P2 IPC 控制链(第二客户端)", "同上:需真实图形协议与 mpv 共屏")
+        skip("P3 四态视觉(播放/暂停/seek/退出)", "同上:V1 视觉套件覆盖")
+        skip("P4 退出回收(mpv 子进程 + rc 0)", "同上:V4/V8 真实终端覆盖")
+
+    # P5: 无 mpv(有 ffmpeg)→ 状态栏 mpv not found + ffmpeg 首帧静图(图片管线)
+    env = media_env(PATH=_path_without("mpv"))
+    s = PtySession(BIN + [clip], cols=80, rows=24, env=env, cwd=ROOT)
+    s.start()
+    s.feed(3.0)
+    task = panic_engine(s)
+    if task:
+        engine_skip("P5 无 mpv → ffmpeg 首帧静图", task)
+        s.close()
+    else:
+        txt = s.screen_text()
+        check("mpv not found" in txt, "P5 状态栏/信息行 mpv not found", txt[:80])
+        check(_half_rows(s), "P5 ffmpeg 首帧进入图片管线(半块字符)")
+        check(
+            not any("mpv" in c for c in _child_cmdlines(s.pid)),
+            "P5 未 spawn mpv 子进程",
+            str(_child_cmdlines(s.pid)),
+        )
+        s.send_key("q")
+        code = s.wait_exit(4)
+        check(code == 0, f"P5 退出码 0 (got {code})")
+        s.close()
+
+    # P6: 无 mpv 且无 ffmpeg → 信息行(文件名/格式/原因)
+    env6 = media_env(PATH=_path_without("mpv", "ffmpeg"))
+    s = PtySession(BIN + [clip], cols=80, rows=24, env=env6, cwd=ROOT)
+    s.start()
+    s.feed(2.5)
+    task = panic_engine(s)
+    if task:
+        engine_skip("P6 无 ffmpeg → 信息行", task)
+    else:
+        txt = s.screen_text()
+        check(os.path.basename(clip) in txt, "P6 信息行含文件名")
+        check("format:" in txt and "note:" in txt, "P6 信息行含格式与原因")
+        check(not _half_rows(s), "P6 无 ffmpeg 时不渲染静图")
+        s.send_key("q")
+        code = s.wait_exit(4)
+        check(code == 0, f"P6 退出码 0 (got {code})")
+    s.close()
+
+    # P7: 有 mpv 但无图形协议(halfblocks)→ 同一降级链,且不 spawn mpv
+    env7 = media_env(PATH=os.environ.get("PATH", ""))
+    s = PtySession(BIN + [clip], cols=80, rows=24, env=env7, cwd=ROOT)
+    s.start()
+    s.feed(3.0)
+    task = panic_engine(s)
+    if task:
+        engine_skip("P7 无图形协议 → 降级链", task)
+    else:
+        txt = s.screen_text()
+        check(
+            "graphics protocol" in txt or "mpv not found" in txt,
+            "P7 降级原因提示(无图形协议/mpv)",
+            txt[:80],
+        )
+        check(
+            not any("mpv" in c for c in _child_cmdlines(s.pid)),
+            "P7 无协议时不启动 mpv",
+            str(_child_cmdlines(s.pid)),
+        )
+        s.send_key("q")
+        code = s.wait_exit(4)
+        check(code == 0, f"P7 退出码 0 (got {code})")
+    s.close()
+
+    # P8: 非 TTY → needs a terminal + rc 1(视频与图片语义一致)
+    r = subprocess.run(BIN + [clip], capture_output=True, text=True, cwd=ROOT, env=media_env())
+    check(r.returncode == 1, f"P8 非 TTY 视频 rc 1 (got {r.returncode})")
+    check("needs a terminal" in r.stderr, "P8 非 TTY 报错文案", r.stderr.strip()[:60])
+
+
+def _scenario_P_real(clip):
+    """真实终端(foot)下的 mpv 路径断言:spawn 参数 + IPC 控制 + 退出回收。"""
+    env = dict(os.environ, DLOOK_IMAGE_PROTOCOL="auto")
+    tag = "dlook-e2e-p"
+    proc = subprocess.Popen(
+        ["foot", "-a", tag, "-T", tag, "--", BIN[0], clip],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
+    try:
+        deadline = time.time() + 12
+        mpv_cmd = None
+        while time.time() < deadline and mpv_cmd is None:
+            for cmd in _child_cmdlines(proc.pid):
+                if "mpv" in cmd:
+                    mpv_cmd = cmd
+                    break
+            time.sleep(0.3)
+        if mpv_cmd is None:
+            skip("P1 mpv spawn 参数", "foot 内未探测到 mpv 子进程(可能无 kitty/sixel 协议)")
+            skip("P2 IPC 控制链", "同上")
+        else:
+            check("--input-ipc-server" in mpv_cmd, "P1 mpv cmdline 含 --input-ipc-server")
+            check(
+                "--vo-kitty" in mpv_cmd or "--vo=sixel" in mpv_cmd or "vo=sixel" in mpv_cmd,
+                "P1 mpv vo 参数",
+                mpv_cmd[:120],
+            )
+            check(
+                re.search(r"vo-kitty-(left|top|rows|cols)", mpv_cmd) is not None,
+                "P1 mpv 区域几何参数",
+                mpv_cmd[:160],
+            )
+            m = re.search(r"--input-ipc-server=(\S+)", mpv_cmd)
+            check(m is not None, "P1 IPC socket 路径可取")
+            if m:
+                ipc = m.group(1)
+                resp = _ipc_cmd(ipc, {"command": ["get_property", "pause"]})
+                check("error" not in resp.lower(), "P2 IPC 第二客户端可读 pause 属性", resp[:80])
+                _ipc_cmd(ipc, {"command": ["set_property", "pause", True]})
+                time.sleep(0.5)
+                resp2 = _ipc_cmd(ipc, {"command": ["get_property", "pause"]})
+                check("true" in resp2, "P2 IPC set pause 生效", resp2[:80])
+    finally:
+        subprocess.run(["hyprctl", "dispatch",
+                        f'hl.dsp.focus({{window="class:{tag}"}})'], capture_output=True)
+        subprocess.run(["wtype", "-k", "q"], capture_output=True)
+        time.sleep(1.0)
+        if proc.poll() is None:
+            proc.terminate()
+        time.sleep(0.5)
+        left = subprocess.run(["pgrep", "-f", "dlook-e2e-p"], capture_output=True, text=True)
+        check(left.returncode != 0 or not left.stdout.strip(), "P4 退出后无残留窗口进程")
+
+
+def _ipc_cmd(sock_path, payload):
+    import json
+    import socket
+
+    try:
+        c = socket.socket(socket.AF_UNIX)
+        c.settimeout(2.0)
+        c.connect(sock_path)
+        c.sendall((json.dumps(payload) + "\n").encode())
+        time.sleep(0.15)
+        c.setblocking(False)
+        try:
+            data = c.recv(65536).decode(errors="replace")
+        except BlockingIOError:
+            data = ""
+        c.close()
+        return data
+    except OSError as ex:
+        return f"ipc error: {ex}"
+
+
+# ---- Q. 网页(design §6:Q1–Q9) ----------------------------------------------
+
+def _web_server(directory=None, routes=None):
+    """本地 http server:(base_url, requests_log, shutdown)。
+
+    routes: {path: (status, ctype, body)} 优先于静态目录;请求全部记录(安全 canary)。
+    """
+    log = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):  # 静默
+            pass
+
+        def do_GET(self):  # noqa: N802
+            log.append(self.path)
+            path = self.path.split("?")[0]
+            if routes is not None:
+                if path not in routes:
+                    self.send_error(404, "not found")
+                    return
+                status, ctype, body = routes[path]
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            local = os.path.join(directory or ".", path.lstrip("/"))
+            try:
+                with open(local, "rb") as f:
+                    body = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except OSError:
+                self.send_error(404, "not found")
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return (f"http://127.0.0.1:{srv.server_address[1]}", log, srv.shutdown)
+
+
+def _xdg_env(tag):
+    log = os.path.join(tempfile.gettempdir(), f"dlook-xdg-{tag}.log")
+    if os.path.exists(log):
+        os.remove(log)
+    fake_bin = os.path.join(ROOT, "test", "e2e", "fake-bin")
+    env = media_env(XDG_LOG=log, PATH=fake_bin + os.pathsep + os.environ["PATH"])
+    return env, log
+
+
+def _xdg_got(log):
+    return open(log).read().strip() if os.path.exists(log) else ""
+
+
+def scenario_Q():
+    print("== Q-web ==")
+    base_url, _reqs, shutdown = _web_server()
+    env, xdg_log = _xdg_env("q")
+
+    # Q1: 本地 .html L1 渲染(标题/标题行/链接/表格)
+    page = os.path.join(FIX, "web", "page.html")
+    s = PtySession(BIN + [page], cols=80, rows=24, env=env, cwd=ROOT)
+    s.start()
+    s.feed(1.5)
+    task = panic_engine(s)
+    if task:
+        engine_skip("Q1–Q9 网页场景", task)
+        s.close()
+        shutdown()
+        return
+    txt = s.screen_text()
+    check("Q Page Title" in s.row(1), "Q1 页面标题进 header", s.row(1)[:50])
+    check("Q Heading" in txt, "Q1 <h1> 渲染为文本")
+    check("item one" in txt, "Q1 列表渲染")
+    check("ext link" in txt and "https://example.com/dlook" in txt, "Q1 链接 label+url 展示")
+    check("q quit" in s.row(24), "Q1 footer 为 pager 键位(无音频会话)")
+
+    # Q2: 点击外部链接 → 系统浏览器(xdg-open 收到 URL);页面不动
+    cell = _find_cell(s, "ext link")
+    check(cell is not None, "Q2 找到外部链接 cell")
+    if cell:
+        _click(s, *cell, settle=0.6)
+        check(_xdg_got(xdg_log) == "https://example.com/dlook",
+              f"Q2 xdg-open 收到 URL (got {_xdg_got(xdg_log)!r})")
+        check(s.row(1).strip().startswith(page), "Q2 外部链接不导航", s.row(1)[:40])
+        check("opened externally" in s.screen_text(), "Q2 状态栏提示 opened")
+
+    # Q3: 本地 .html 链接 → 应用内跳转(推历史栈)
+    cell = _find_cell(s, "local link")
+    check(cell is not None, "Q3 找到本地链接 cell")
+    if cell:
+        _click(s, *cell, settle=1.0)
+        check("next.html" in s.row(1), "Q3 应用内跳转到 next.html", s.row(1)[:60])
+        check("Next Page Marker" in s.screen_text(), "Q3 目标页渲染")
+        check("back" in s.row(24), "Q3 footer 出现 back 提示")
+
+        # Q4: ⌫ 返回
+        s.send_key("Backspace")
+        s.feed(0.6)
+        check(page in s.row(1), "Q4 ⌫ 返回原页", s.row(1)[:60])
+
+    # Q5: 安全 canary —— 不请求任何子资源(img/css/js 不进网络)
+    canary_url, canary_log, canary_shutdown = _web_server(
+        routes={"/canary.html": (200, "text/html; charset=utf-8",
+                                 b"<html><head><title>C</title>"
+                                 b"<link rel=stylesheet href='/style.css'></head>"
+                                 b"<body><h1>Canary</h1>"
+                                 b"<img src='/pixel.png'>"
+                                 b"<script src='/app.js'></script></body></html>")}
+    )
+    s = PtySession(BIN + [canary_url + "/canary.html"], cols=80, rows=24, env=env, cwd=ROOT)
+    s.start()
+    s.feed(1.5)
+    if not panic_engine(s):
+        check("Canary" in s.screen_text(), "Q5 canary 页面渲染")
+        subs = [r for r in canary_log if r != "/canary.html"]
+        check(not subs, "Q5 不请求任何子资源(防追踪像素)", str(subs))
+        s.send_key("q")
+        s.wait_exit(3)
+    else:
+        engine_skip("Q5 安全 canary", "media-2")
+    s.close()
+    canary_shutdown()
+
+    # Q6: GBK 编码页不炸
+    gbk_url, _gl, gbk_shutdown = _web_server(
+        routes={"/gbk.html": (200, "text/html; charset=gbk",
+                              "<html><head><title>GBK</title></head>"
+                              "<body><p>中文编码测试</p></body></html>".encode("gbk"))}
+    )
+    s = PtySession(BIN + [gbk_url + "/gbk.html"], cols=80, rows=24, env=env, cwd=ROOT)
+    s.start()
+    s.feed(1.5)
+    if not panic_engine(s):
+        check(s.wait_exit(0.2) is None, "Q6 GBK 页面不崩")
+        check("GBK" in s.screen_text(), "Q6 GBK 页渲染出内容")
+        s.send_key("q")
+        code = s.wait_exit(3)
+        check(code == 0, f"Q6 GBK 页 q 退出 0 (got {code})")
+    else:
+        engine_skip("Q6 GBK 不炸", "media-2")
+    s.close()
+    gbk_shutdown()
+
+    # Q7: 4xx → ✗ 行 + 不退出
+    err_url, _el, err_shutdown = _web_server(routes={})
+    s = PtySession(BIN + [err_url + "/nope.html"], cols=80, rows=24, env=env, cwd=ROOT)
+    s.start()
+    s.feed(2.0)
+    if not panic_engine(s):
+        check("✗" in s.screen_text(), "Q7 4xx 错误行 ✗", s.screen_text()[:80])
+        check(s.wait_exit(0.2) is None, "Q7 抓取失败不退出")
+        s.send_key("q")
+        code = s.wait_exit(3)
+        check(code == 0, f"Q7 失败态 q 退出 0 (got {code})")
+    else:
+        engine_skip("Q7 4xx 提示", "media-2")
+    s.close()
+    err_shutdown()
+
+    # Q8: `o` 键 → 系统浏览器打开当前页
+    s = PtySession(BIN + [page], cols=80, rows=24, env=env, cwd=ROOT)
+    s.start()
+    s.feed(1.2)
+    if not panic_engine(s):
+        if os.path.exists(xdg_log):
+            os.remove(xdg_log)
+        s.send_key("o")
+        s.feed(0.8)
+        got = _xdg_got(xdg_log)
+        check(got.startswith("file://") and got.endswith("page.html"),
+              f"Q8 o 键浏览器打开当前页 (got {got!r})")
+        check("opened in browser" in s.screen_text(), "Q8 状态栏 opened in browser")
+        s.send_key("q")
+        s.wait_exit(3)
+    else:
+        engine_skip("Q8 o 键浏览器", "media-2")
+    s.close()
+    shutdown()
+
+    # Q9: 非 TTY URL → needs a terminal + rc 1
+    r = subprocess.run(BIN + [base_url + "/page.html"], capture_output=True, text=True,
+                       cwd=ROOT, env=env)
+    check(r.returncode == 1, f"Q9 非 TTY 网页 rc 1 (got {r.returncode})")
+    check("needs a terminal" in r.stderr, "Q9 非 TTY 报错文案", r.stderr.strip()[:60])
+
+
+# ---- R. 鼠标/交互(design §6:R1–R6) -----------------------------------------
+
+def scenario_R():
+    print("== R-interaction ==")
+    wav = ensure_audio_fixture()
+    env = media_env()
+    s = PtySession(BIN + [wav], cols=80, rows=24, env=env, cwd=ROOT)
+    s.start()
+    s.feed(1.2)
+    task = panic_engine(s)
+    if task:
+        engine_skip("R1–R4/R6 媒体鼠标交互", task)
+        s.close()
+        _scenario_R5_back()  # R5 不依赖引擎
+        return
+
+    pr = progress_row(s)
+    ir = info_row(s)
+    cells = progress_cells(s)
+    check(pr is not None and ir is not None and cells is not None, "R0 媒体栏命中区可定位")
+    playing_ok = require_playback(s, "R1–R4 媒体鼠标交互")
+
+    if playing_ok and cells:
+        left, width = cells
+        # R1: click-to-seek 比例断言(x = left + 50% → 位置 ≈ 4/8s)
+        _click(s, left + width // 2, pr, settle=0.8)
+        pos, dur = timecodes(s)
+        check(dur == 8 and pos is not None and 3 <= pos <= 5,
+              f"R1 点击 50% → 位置≈04 (got {pos}/{dur})")
+        check("seek" in s.screen_text(), "R1 状态栏 seek 反馈")
+
+        # R2: scrubbing —— 预览更新不随拖动次数膨胀(≤ 帧数),松开提交最后比例
+        base = len(s.raw_text())
+        s.send(_sgr("M", 0, left + 2, pr))
+        s.feed(0.05)
+        for x in range(left + 3, left + width - 1, 3):
+            s.send(_sgr("M", 32, x, pr))
+        s.feed(0.45)
+        previews = re.findall(r"seek \d+%", s.raw_text()[base:])
+        s.send(_sgr("m", 0, left + width - 2, pr))
+        s.feed(0.7)
+        pos2, _d = timecodes(s)
+        check(len(previews) <= 4, f"R2 拖动预览不刷屏(共 {len(previews)} 次更新)")
+        check(pos2 is not None and pos2 >= 6, f"R2 松开提交最后比例 (got {pos2})")
+        # 120ms 节流的精确断言在单元测试 scrub_preview_is_throttled(pty 只能观察绘制帧)
+
+        # R3: 滚轮三区语义(先回曲首暂停:曲末 finished 后 seek 被引擎忽略)
+        s.send_key("0")
+        s.feed(0.6)
+        s.send_key("p")
+        s.feed(0.4)
+        s.send_key("Right")  # → 00:05,给滚轮留出回退空间
+        s.feed(0.5)
+        before = timecodes(s)[0]
+        _wheel(s, True, left + width // 2, pr)
+        after = timecodes(s)[0]
+        check(before == 5 and after == 0,
+              f"R3 进度条滚轮 seek -5s ({before}→{after})")
+        vol_before = re.search(r"(\d+)%", s.row(ir))
+        _wheel(s, True, s.cols - 3, ir)
+        vol_after = re.search(r"(\d+)%", s.row(ir))
+        check(
+            vol_before is not None and vol_after is not None
+            and int(vol_after.group(1)) > int(vol_before.group(1)),
+            f"R3 音量区滚轮 +5% "
+            f"({vol_before and vol_before.group(0)} → {vol_after and vol_after.group(0)})",
+        )
+
+        # R4: 信息行非音量区单击 = 播放/暂停
+        before_icon = s.row(ir)
+        _click(s, 5, ir, settle=0.7)
+        after_icon = s.row(ir)
+        check(
+            ("\u25ae\u25ae" in after_icon) != ("\u25ae\u25ae" in before_icon),
+            "R4 信息行单击切换播放/暂停",
+            f"{before_icon[:20]!r} → {after_icon[:20]!r}",
+        )
+        _click(s, 5, ir, settle=0.5)
+
+    # R6: footer 分层 token ≤ 8(M1 媒体键位;等状态消息过期)
+    s.feed(1.8)
+    toks = s.row(24).split()
+    check(all(len(t) <= 8 for t in toks), "R6 M1 footer token ≤ 8",
+          str([t for t in toks if len(t) > 8]))
+    check("space" in toks and "seek" in toks and "mute" in toks, "R6 M1 footer 含媒体键位")
+
+    s.send_key("q")
+    s.wait_exit(3)
+    s.close()
+
+    _scenario_R5_back()
+
+
+def _scenario_R5_back():
+    """R5:中键 = 返回(⌫ 语义)。文档区,不依赖媒体引擎。"""
+    src = os.path.join(FIX, "link-src.md")
+    s = PtySession(BIN + [src], cols=80, rows=24, env=os.environ, cwd=ROOT)
+    s.start()
+    if not s.wait_for("Link Source", 6):
+        bad("R5 启动 link-src.md (app did not start)")
+        s.close()
+        return
+    cell = _find_cell(s, "dst\u2197")
+    if not cell:
+        bad("R5 找到本地链接 cell")
+        s.close()
+        return
+    _click(s, *cell, settle=0.9)
+    check("link-dst.md" in s.row(1), "R5 前置:点击链接跳转成功", s.row(1)[:40])
+    _mid_click(s, 5, 5, settle=0.9)
+    check("link-src.md" in s.row(1), "R5 中键返回上一文件", s.row(1)[:40])
+    _mid_click(s, 5, 5, settle=0.6)
+    check(s.wait_exit(0.2) is None, "R5 无历史中键不退出")
+    s.send_key("q")
+    s.wait_exit(3)
+    s.close()
 
 
 if __name__ == "__main__":
