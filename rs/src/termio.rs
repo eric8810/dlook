@@ -827,6 +827,11 @@ impl MediaState {
         self.video_phase_now() != self.video_phase
     }
 
+    /// 已记录的相位（清屏判定用）。
+    fn video_phase(&self) -> u8 {
+        self.video_phase
+    }
+
     /// 当前相位读数（无会话 = 255）。
     fn video_phase_now(&self) -> u8 {
         if !self.video_active {
@@ -1306,17 +1311,35 @@ fn event_loop(
     let exit_code = loop {
         children.retain_mut(|c| c.try_wait().map(|r| r.is_none()).unwrap_or(false));
 
-        let view = media.view();
-        let _ = terminal.draw(|f| {
-            render_frame(
-                f,
-                doc,
-                &nav.path,
-                &mut ui,
-                &view,
-                !nav.history.is_empty(),
-            )
-        });
+        // 视频共屏的关键约束:mpv 用 sixel/kitty **转义序列**画 body 区,与 dlook 自己的
+        // 输出共用同一条 tty 写流。若 dlook 在 mpv 流式输出期间写入(哪怕只是重绘
+        // header/footer 的 diff),字节会插进 mpv 的转义序列中间,终端把残余载荷当文本
+        // 打印 → 满屏乱码并覆盖 chrome(V 套件实测的撕裂现象)。
+        //
+        // 因此:mpv 会话活跃期间 **dlook 完全不写终端**(既不清屏也不 draw),
+        // 只在视频生命周期相位变化的那一拍统一写一次 chrome(那一刻 mpv 正在启动或
+        // 已退出,其转义流未在途,写入是安全的;mpv 启动/退出各发一次 `\033_Ga=d`
+        // 清空终端全部图像,故相位变化时全量重绘)。
+        let video_phase = media.video_phase_now();
+        let mpv_owns_tty = video_phase == 1; // Playing/Paused:mpv 正在画
+        let phase_changed = media.video_phase() != video_phase;
+        if phase_changed {
+            media.sync_video_phase();
+            let _ = terminal.clear();
+        }
+        if !mpv_owns_tty || phase_changed {
+            let view = media.view();
+            let _ = terminal.draw(|f| {
+                render_frame(
+                    f,
+                    doc,
+                    &nav.path,
+                    &mut ui,
+                    &view,
+                    !nav.history.is_empty(),
+                )
+            });
+        }
 
         // 用 poll 非阻塞检查终端事件(200ms 超时兼作热重载轮询周期)
         if event::poll(Duration::from_millis(200)).unwrap_or(false) {
