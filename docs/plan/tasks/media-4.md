@@ -2,7 +2,7 @@
 id: media-4
 package: rs
 module: termio.rs / doc.rs / args.rs / main.rs / content.rs / lang.rs / test/e2e
-status: ready
+status: in-progress
 depends-on: []
 ---
 
