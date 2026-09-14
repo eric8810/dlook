@@ -815,8 +815,18 @@ def v1_image():
     s.close()
 
     # 基线：同几何文本渲染（串行开窗，几何一致）
-    base = Session("v1-txt", [os.path.join("plain.txt")], label="v1-text").start()
-    state_b = base.wait_ready()
+    # 注：偶发 `exited:0`（前一会话清理的 SIGTERM 波及新窗口 / 启动竞态）→ 重试一次，
+    # 避免把 flaky 当 SKIP（SKIP 应表示环境缺失，不表示抖动）。
+    base = None
+    state_b = None
+    for attempt in (1, 2):
+        base = Session("v1-txt", [os.path.join("plain.txt")], label="v1-text").start()
+        state_b = base.wait_ready()
+        if state_b == "ready":
+            break
+        print(f"    (info) V1 文本基线第 {attempt} 次未就绪({state_b})，重试")
+        base.close()
+        time.sleep(0.8)
     if state_b == "ready":
         bshot = base.shot("text")
         ab = base.anchor_for("text")
