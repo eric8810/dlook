@@ -42,6 +42,10 @@ images.rs      图片管线(既有 D15);新增 graphics_proto() 供视频选 vo 
 **冻结接口**：见各模块脚手架内 `pub fn` 签名与文档注释（media.rs / web.rs / video.rs）。
 实现方不得改变签名；需要变更交回主 agent 统一协调。
 
+**接口变更记录**：
+- 2026-09-13：`VideoCtx` 增加 `toggle_mute()`（集成期由 termio 报告缺口：设计 §3 的 `m` 键
+  对视频无对应接口；与 `AudioCtx::toggle_mute` 语义一致）。由主 agent 统一修改。
+
 ## 3. 交互规范（M1 全屏媒体 / M2 媒体栏）
 
 **上下文判定**：

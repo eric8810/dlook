@@ -106,6 +106,12 @@ impl VideoCtx {
         todo!("video::VideoCtx::adjust_volume — task media-3")
     }
 
+    /// 静音切换(mpv `mute` 属性;实现需记录静音前音量以恢复,与 AudioCtx 语义一致)。
+    /// 接口由主 agent 于集成期补充(termio 报告 §3 `m` 键对视频缺失;2026-09-13)。
+    pub fn toggle_mute(&self) {
+        todo!("video::VideoCtx::toggle_mute — task media-3")
+    }
+
     /// 设置显示区域(resize 时调用;实现按 mpv 能力选择重启或热改属性)。
     pub fn set_area(&self, _area: VideoArea) {
         todo!("video::VideoCtx::set_area — task media-3")
