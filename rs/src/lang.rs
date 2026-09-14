@@ -157,6 +157,9 @@ pub fn is_audio_ext(file_name: &str) -> bool {
 }
 
 /// 是否为视频扩展名(DECISIONS D16,委托 mpv 播放)。
+/// 注意:`.ts` **不在此列**——它与 TypeScript 源码扩展名冲突,而 dlook 是文档/代码
+/// 预览器,TypeScript 是主力支持语言(集成验证期发现该回归并修正)。
+/// MPEG-TS 视频可用 `.m2ts/.mts` 等扩展名,或后续按内容嗅探另行处理。
 pub fn is_video_ext(file_name: &str) -> bool {
     let base = file_name.rsplit('/').next().unwrap_or(file_name);
     let lower = base.to_lowercase();
@@ -165,7 +168,7 @@ pub fn is_video_ext(file_name: &str) -> bool {
             let ext = &lower[dot + 1..];
             matches!(
                 ext,
-                "mp4" | "mkv" | "webm" | "mov" | "avi" | "m4v" | "mpg" | "mpeg" | "ts" | "flv"
+                "mp4" | "mkv" | "webm" | "mov" | "avi" | "m4v" | "mpg" | "mpeg" | "m2ts" | "mts" | "flv"
             )
         }
         None => false,
