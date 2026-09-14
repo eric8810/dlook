@@ -153,6 +153,22 @@ impl ImageCtx {
         }
     }
 
+    /// 终端单元格的像素尺寸(宽, 高);未探测到时为 None。
+    ///
+    /// 视频委托 mpv 时需要它:mpv 的 `--vo-<vo>-width/height` 是**像素**单位,
+    /// 只给 cols/rows 时 mpv 在本机 foot 下拿不到终端像素尺寸、回退到 320×180
+    /// (小画面,远小于 body 区)。集成验证期发现,见 media-3 验收 N1。
+    pub fn cell_pixel_size(&self) -> Option<(u16, u16)> {
+        if self.off {
+            return None;
+        }
+        let guard = self.picker.lock().unwrap();
+        guard.as_ref().map(|p| {
+            let fs = p.font_size();
+            (fs.width, fs.height)
+        })
+    }
+
     /// dirty 计数(加载/重编码完成会 +1;事件循环比对后触发重排)。
     pub fn dirty_version(&self) -> u64 {
         self.shared.dirty.load(Ordering::SeqCst)

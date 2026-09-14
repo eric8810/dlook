@@ -339,12 +339,30 @@ fn video_plan(mpv_available: bool, proto_available: bool, ffmpeg_available: bool
 }
 
 /// mpv 显示区域（design §5.1）：left=H_MARGIN, top=1, cols=内容宽, rows=body 行数。
+/// 视频区几何（终端格）+ 像素尺寸。
+///
+/// `cell_px` 为终端单元格像素尺寸（来自 picker）。为 None 时 mpv 会回退 320×180
+/// 小画面（本机 foot 下实测，media-3 验收 N1），故有探测信息时一律给出像素尺寸。
+fn video_area_for_with(term_w: u16, term_h: u16, bar_h: u16, cell_px: Option<(u16, u16)>) -> VideoArea {
+    let mut area = video_area_for(term_w, term_h, bar_h);
+    if let Some((cw, ch)) = cell_px {
+        if cw > 0 && ch > 0 {
+            area.pixel = Some((
+                area.cols as u32 * cw as u32,
+                area.rows as u32 * ch as u32,
+            ));
+        }
+    }
+    area
+}
+
 fn video_area_for(term_w: u16, term_h: u16, bar_h: u16) -> VideoArea {
     VideoArea {
         left: H_MARGIN,
         top: 1,
         cols: content_width(term_w),
         rows: term_h.saturating_sub(2 + bar_h),
+        pixel: None,
     }
 }
 
@@ -605,12 +623,16 @@ impl MediaState {
     }
 
     /// 启动视频会话；按降级链回退。返回 true 表示进入 mpv 共屏形态。
+    ///
+    /// `cell_px` 为终端单元格像素尺寸（picker 探测所得）；给出时把 body 区的像素尺寸
+    /// 传给 mpv，否则 mpv 会回退 320×180 小画面（media-3 验收 N1）。
     fn start_video(
         &mut self,
         src: &str,
         term_w: u16,
         term_h: u16,
         proto: Option<TermProto>,
+        cell_px: Option<(u16, u16)>,
     ) -> bool {
         self.stop_video();
         self.stop_audio();
@@ -622,7 +644,7 @@ impl MediaState {
             VideoPlan::Mpv => {
                 // area 的 bar_h 与首帧渲染一致（有会话 → 2 行或折叠 1 行）
                 let bar_h = bar_height_for(term_h, true);
-                let area = video_area_for(term_w, term_h, bar_h);
+                let area = video_area_for_with(term_w, term_h, bar_h, cell_px);
                 match self.video.start(src, area, proto.expect("proto checked by plan")) {
                     Ok(()) => {
                         self.video_active = true;
@@ -1289,7 +1311,7 @@ fn event_loop(
         Mode::Video => {
             let (w, h) = current_size(terminal);
             let proto = proto_of(img_ctx);
-            media.start_video(&nav.path, w, h, proto);
+            media.start_video(&nav.path, w, h, proto, img_ctx.cell_pixel_size());
             if media.video_active {
                 // mpv 启动会清空终端图像(研究 §已知坑:\033_Ga=d)→ 全量重绘
                 let _ = terminal.clear();
@@ -1482,7 +1504,8 @@ fn event_loop(
                     // 视频区几何变化 → 重算 area 并调 set_area + 全量重绘(design §5.3)
                     if media.video_active {
                         let bar_h = bar_height_for(h, true);
-                        media.set_area(video_area_for(w, h, bar_h));
+                        media.set_area(video_area_for_with(
+                            w, h, bar_h, img_ctx.cell_pixel_size()));
                         let _ = terminal.clear();
                     }
                     rebuild_doc(terminal, doc, &nav, &content, &mut ui, hl, skin, img_ctx, &media.input);
@@ -1650,7 +1673,7 @@ fn retarget_media(
         Mode::Video => {
             let (w, h) = current_size(terminal);
             let proto = proto_of(img_ctx);
-            if media.start_video(&nav.path, w, h, proto) {
+            if media.start_video(&nav.path, w, h, proto, img_ctx.cell_pixel_size()) {
                 let _ = terminal.clear();
             } else {
                 let reason = media.degrade_reason.clone();

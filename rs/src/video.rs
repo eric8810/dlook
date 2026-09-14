@@ -61,13 +61,19 @@ const MAX_IPC_FAILURES: u32 = 5;
 const DEFAULT_VOLUME: f32 = 0.8;
 
 /// 视频显示区域(终端格坐标,相对整个终端;由集成层按布局算出)。
-/// left/top 从 0 计;rows/cols 为区域尺寸。
+/// left/top 从 0 计;rows/cols 为区域尺寸;pixel 为像素尺寸(可选)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoArea {
     pub left: u16,
     pub top: u16,
     pub cols: u16,
     pub rows: u16,
+    /// body 区的**像素**尺寸(宽, 高);None = 未知(不传 width/height 给 mpv)。
+    ///
+    /// mpv 的 `--vo-<vo>-width/height` 是像素单位。只给 cols/rows 时,在本机 foot 下
+    /// mpv 拿不到终端像素尺寸 → 回退 320×180 小画面(集成验证期发现,media-3 验收 N1)。
+    /// 由集成层用 picker 的单元格像素尺寸 × 格数算出。
+    pub pixel: Option<(u32, u32)>,
 }
 
 /// 终端图形协议(来自 ratatui-image picker 的探测结论,决定 mpv 的 vo)。
@@ -1059,6 +1065,14 @@ fn build_command(
         format!("--vo-{vo}-top={}", area.top.saturating_add(1)).into(),
         format!("--vo-{vo}-cols={}", area.cols.max(1)).into(),
         format!("--vo-{vo}-rows={}", area.rows.max(1)).into(),
+    ];
+    // 像素尺寸:只给 cols/rows 时 mpv 在本机 foot 下拿不到终端像素尺寸,会回退
+    // 320×180 小画面(集成验证期实测;media-3 验收 N1)。给出后 mpv 按像素精确渲染。
+    if let Some((px_w, px_h)) = area.pixel {
+        args.push(format!("--vo-{vo}-width={}", px_w.max(1)).into());
+        args.push(format!("--vo-{vo}-height={}", px_h.max(1)).into());
+    }
+    args.extend([
         // alt-screen / config-clear 必须显式关:否则与 dlook 的 ratatui alt-screen 打架,
         // 且 reconfig 时清空终端全部图像(研究 §已知坑)
         format!("--vo-{vo}-alt-screen=no").into(),
@@ -1075,7 +1089,7 @@ fn build_command(
         "--audio-display=no".into(), // 视频模式下不弹音频可视化窗
         format!("--input-ipc-server={}", sock.display()).into(),
         src.into(),
-    ];
+    ]);
     for extra in extra_args {
         args.push((*extra).into());
     }
@@ -1306,6 +1320,9 @@ mod tests {
             top: 3,
             cols: 60,
             rows: 16,
+            // 像素尺寸:集成验证期发现不给它时 mpv 回退 320×180 小画面(验收 N1),
+            // 故测试默认带上,让 build_command 的像素分支也被覆盖。
+            pixel: Some((640, 360)),
         }
     }
 
@@ -1385,6 +1402,10 @@ mod tests {
             "--vo-kitty-top=4",
             "--vo-kitty-cols=60",
             "--vo-kitty-rows=16",
+            // 像素尺寸必须传:只给 cols/rows 时 mpv 在本机 foot 下拿不到终端像素尺寸,
+            // 会回退 320×180 小画面(集成验证期实测,media-3 验收 N1)
+            "--vo-kitty-width=640",
+            "--vo-kitty-height=360",
             "--vo-kitty-alt-screen=no",
             "--vo-kitty-config-clear=no",
             "--no-terminal",
@@ -1415,6 +1436,8 @@ mod tests {
             "--vo-sixel-top=4",
             "--vo-sixel-cols=60",
             "--vo-sixel-rows=16",
+            "--vo-sixel-width=640",
+            "--vo-sixel-height=360",
             "--vo-sixel-alt-screen=no",
             "--vo-sixel-config-clear=no",
         ] {
@@ -1711,6 +1734,7 @@ mod tests {
             top: 1,
             cols: 40,
             rows: 10,
+            pixel: Some((400, 240)),
         };
         ctx.set_area(a2);
         let deadline = Instant::now() + Duration::from_secs(6);
