@@ -2,6 +2,7 @@ name: release
 
 # 只在推送 v* 标签时触发，构建 release binary 并发布到 GitHub Release。
 # 不做 lint/test 等额外验证 —— 只打包，保证发版顺畅。
+# 平台：Linux x86_64 + macOS x86_64/aarch64（Windows 见下方注释）。
 on:
   push:
     tags:
@@ -26,9 +27,9 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             archive: tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
+          # Windows 暂时移出矩阵（v0.5.0）：视频会话基于 Unix domain socket，
+          # 尚未实现 Windows 版本；代码已用 cfg(unix) 收敛，但发布产物暂不含
+          # Windows。恢复时把下面三行加回矩阵，并确认 CI 能构建 ring（需 MSVC 工具链）。
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7

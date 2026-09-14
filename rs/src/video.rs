@@ -1536,10 +1536,13 @@ fn wait_or_kill(child: Option<&mut Child>, limit: Duration) {
 
 /// 可读的退出原因(信号/退出码;`--really-quiet` 下 mpv 不打 stderr,只能合成)。
 fn exit_reason(status: ExitStatus, src: &str) -> String {
+    // 信号只在 Unix 有(`ExitStatusExt::signal`);Windows 走退出码分支。
     #[cfg(unix)]
-    use std::os::unix::process::ExitStatusExt;
-    if let Some(sig) = status.signal() {
-        return format!("mpv killed by signal {sig} ({src})");
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return format!("mpv killed by signal {sig} ({src})");
+        }
     }
     match status.code() {
         Some(0) => format!("mpv exited (end of file): {src}"),
