@@ -1106,55 +1106,168 @@ def scenario_O():
     check(r.returncode == 1, f"O14 非 TTY 音频 rc 1 (got {r.returncode})")
     check("needs a terminal" in r.stderr, "O14 非 TTY 报错文案", r.stderr.strip()[:60])
 
+    # O15: 直开路径形态(集成期回归:链接基准二次拼接 → `✗ not found`;`..` 前缀被
+    # links::normalize 吞掉)。逐形态断言「进入 Playing + 时长正确 + 无 not found」。
+    # 注意:本组用例从**不同的 cwd** 启动,故被测二进制必须用绝对路径。
+    abs_bin = BIN if os.path.isabs(BIN[0]) else [os.path.join(ROOT, BIN[0])] + BIN[1:]
+    cases = [
+        ("相对 cwd", [os.path.join("test", "fixtures", "audio", "tone.wav")], ROOT),
+        ("绝对路径", [wav], "/tmp"),
+        ("fixtures 内相对", [os.path.join("audio", "tone.wav")], FIX),
+        ("父目录 ../", [os.path.join("..", "audio", "tone.wav")],
+         os.path.join(FIX, "img")),
+        ("file:// URL", ["file://" + wav], "/tmp"),
+    ]
+    for label, argv, cwd in cases:
+        s = PtySession(abs_bin + argv, cols=80, rows=24, env=env, cwd=cwd)
+        s.start()
+        s.feed(2.2)
+        if panic_engine(s):
+            engine_skip(f"O15 直开路径形态 {label}", "media-1")
+            s.close()
+            continue
+        pos, dur = timecodes(s)
+        err = bar_error(s)
+        check(
+            dur == 8 and pos is not None and err is None,
+            f"O15 直开 {label} 进入播放且时长 00:08",
+            f"pos={pos} dur={dur} err={err}",
+        )
+        s.send_key("q")
+        code = s.wait_exit(3)
+        check(code == 0, f"O15 直开 {label} q 退出 0 (got {code})")
+        s.close()
+
 
 def scenario_O_e9():
-    """E9 探针:证明样本真的到达设备(null sink + monitor 录制)。
+    """E9 探针:证明 dlook 的音频样本真的到达输出设备(null sink + monitor 录制)。
 
-    默认跳过(需 pactl/pw-record 且显式 DLOOK_E2E_E9=1);跳过分支显式标记。
+    默认跳过(需 pactl+ffmpeg 且显式 DLOOK_E2E_E9=1);跳过分支显式标记。
+
+    方法学(独立验收发现并修正,见 /tmp/reviews/media-1-dimagent.md F2):
+      - **必须用 `ffmpeg -f pulse -i <sink>.monitor`**:`pw-record --target
+        <sink>.monitor` 并不会绑定到 monitor(monitor 不是 PipeWire 节点),
+        它会静默回退到麦克风 → 静音时也录到噪声(RMS≈1500),使探针**假阳性**
+        (不播放任何音频也能通过阈值)。实测对照:静音基线下 ffmpeg monitor
+        RMS=0.0,pw-record --target RMS=1488.5。
+      - **必须先录静音基线**:基线 >0 说明录制源不对(未绑定/串到麦克风),
+        直接判失败而不是放行,这是防假阳性的关键。
+      - **归因靠 `pactl move-sink-input`**:`PULSE_SINK` 环境变量对 dlook
+        无效(其流仍在默认输出),故把 dlook 的流显式移到测试 sink,确保
+        录到的确实是它的输出。
     """
     print("== O-e9 (audio probe) ==")
     if os.environ.get("DLOOK_E2E_E9") != "1":
-        skip("O-E9 null-sink 录制探针", "未启用(DLOOK_E2E_E9=1 时运行;需 pactl+pw-record)")
+        skip("O-E9 null-sink 录制探针", "未启用(DLOOK_E2E_E9=1 时运行;需 pactl+ffmpeg)")
         return
-    tools = {t: shutil.which(t) for t in ("pactl", "pw-record")}
+    tools = {t: shutil.which(t) for t in ("pactl", "ffmpeg")}
     if not all(tools.values()):
         skip("O-E9 null-sink 录制探针", f"缺少工具 {[k for k, v in tools.items() if not v]}")
         return
     wav = ensure_audio_fixture()
-    log = os.path.join(tempfile.gettempdir(), "dlook-e9-rec.wav")
-    subprocess.run(
-        [tools["pactl"], "load-module", "module-null-sink", "sink_name=dlook-e2e"],
-        check=False, capture_output=True,
-    )
-    rec = subprocess.Popen(
-        [tools["pw-record"], "--target", "dlook-e2e.monitor", "--channels", "2",
-         "--rate", "44100", log],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    time.sleep(0.4)
-    s = PtySession(BIN + [wav], cols=80, rows=24, env=media_env(PULSE_SINK="dlook-e2e"), cwd=ROOT)
-    s.start()
-    s.feed(2.5)
-    s.send_key("q")
-    s.wait_exit(3)
-    s.close()
-    rec.terminate()
-    time.sleep(0.3)
-    subprocess.run([tools["pactl"], "unload-module", "module-null-sink"], check=False,
-                   capture_output=True)
-    try:
+    sink = "dlook-e2e"
+    mon = f"{sink}.monitor"
+
+    def record(path, seconds):
+        return subprocess.Popen(
+            [tools["ffmpeg"], "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "pulse", "-i", mon, "-t", str(seconds), path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    def rms_of(path):
         import math
         import struct
         import wave as wave_mod
 
-        with wave_mod.open(log) as w:
+        with wave_mod.open(path) as w:
             frames = w.readframes(w.getnframes())
             ch = w.getnchannels() or 1
         samples = struct.unpack(f"<{len(frames)//2}h", frames)[::ch]
-        rms = math.sqrt(sum(v * v for v in samples) / max(1, len(samples)))
-        check(rms > 100, f"O-E9 探针捕获到非静音样本 (RMS={rms:.0f})")
+        if not samples:
+            return None
+        return math.sqrt(sum(v * v for v in samples) / len(samples))
+
+    def stream_index_of(needle):
+        """在 pactl sink-inputs 里找到 dlook 的流索引。
+
+        实测 dlook 的流标识为 `application.name = "PipeWire ALSA [dlook]"`
+        (`media.name = "ALSA Playback"`),**不含源文件路径**,故按进程名匹配。
+        """
+        out = subprocess.run(
+            [tools["pactl"], "list", "sink-inputs"],
+            capture_output=True, text=True,
+        ).stdout
+        idx = None
+        for line in out.splitlines():
+            m = re.match(r"\s*Sink Input #(\d+)", line)
+            if m:
+                idx = m.group(1)
+            if needle in line and idx is not None:
+                return idx
+        return None
+
+    baseline = os.path.join(tempfile.gettempdir(), "dlook-e9-baseline.wav")
+    log = os.path.join(tempfile.gettempdir(), "dlook-e9-rec.wav")
+    for p in (baseline, log):
+        if os.path.exists(p):
+            os.remove(p)
+
+    subprocess.run([tools["pactl"], "load-module", "module-null-sink", f"sink_name={sink}"],
+                   check=False, capture_output=True)
+    try:
+        # 1) 静音基线:证明录制确实绑在 monitor 上(否则后面一切通过都是假的)
+        base_rec = record(baseline, 1.2)
+        base_rec.wait(timeout=10)
+        base_rms = rms_of(baseline)
+        ok_bind = base_rms is not None and base_rms < 50
+        check(ok_bind,
+              f"O-E9 录制绑定正确(静音基线 RMS={base_rms if base_rms is None else round(base_rms)}<50)",
+              f"基线非静音 → 录制源不对(monitor 未绑定),探针会假阳性")
+        if not ok_bind:
+            return
+
+        # 2) 播放 dlook,同时录制;把它的流显式移到测试 sink(归因)
+        rec = record(log, 3.0)
+        time.sleep(0.4)
+        s = PtySession(BIN + [wav], cols=80, rows=24, env=media_env(), cwd=ROOT)
+        s.start()
+        s.feed(1.2)
+        idx = stream_index_of("dlook")
+        if idx:
+            subprocess.run([tools["pactl"], "move-sink-input", idx, sink],
+                           check=False, capture_output=True)
+        s.feed(1.6)
+        s.send_key("q")
+        s.wait_exit(3)
+        s.close()
+        rec.wait(timeout=15)
+
+        # 3) 断言:播放段显著高于静音基线
+        play_rms = rms_of(log)
+        check(play_rms is not None and play_rms > 500,
+              f"O-E9 探针捕获到 dlook 的真实输出 (RMS={play_rms if play_rms is None else round(play_rms)})",
+              f"基线={base_rms} 播放={play_rms} (归因流索引={idx})")
     except Exception as ex:  # noqa: BLE001
-        skip("O-E9 探针读回", f"录制文件不可读: {ex}")
+        skip("O-E9 探针", f"异常: {ex}")
+    finally:
+        subprocess.run([tools["pactl"], "unload-module", "module-null-sink"],
+                       check=False, capture_output=True)
+
+
+def _wait_reason(s, needle, alt=None, timeout=2.0):
+    """轮询屏幕直到出现降级理由文案(状态栏 1.5s TTL,须尽早读)。
+
+    返回最后一次屏幕快照;超时未出现则返回其中的文本,由调用方断言(打明细)。
+    """
+    deadline = time.time() + timeout
+    txt = ""
+    while time.time() < deadline:
+        txt = s.screen_text()
+        if needle in txt or (alt and alt in txt):
+            return txt
+        s.feed(0.15)
+    return txt
 
 
 # ---- P. 视频(design §6:P1–P8) ---------------------------------------------
@@ -1208,7 +1321,12 @@ def _video_fixture():
 
 
 def _path_without(*progs):
-    """PATH 去掉指定可执行所在目录(用于模拟 mpv/ffmpeg 缺失)。"""
+    """PATH 去掉指定可执行所在目录(用于模拟 mpv/ffmpeg 缺失)。
+
+    注意:mpv 与 ffmpeg 常在同一目录(/usr/bin),按目录剔除会把两个都剔掉,
+    无法构造「有 ffmpeg 无 mpv」的降级链场景 —— 用 `_path_excluding` 代替。
+    保留本函数供「整个目录不可用」的粗粒度场景使用。
+    """
     drop_dirs = set()
     for p in progs:
         loc = shutil.which(p)
@@ -1217,6 +1335,30 @@ def _path_without(*progs):
     keep = [d for d in os.environ.get("PATH", "").split(os.pathsep)
             if d and d not in drop_dirs]
     return os.pathsep.join(keep)
+
+
+def _path_excluding(*progs):
+    """构造一个「除 progs 外与当前 PATH 等价」的 PATH(临时符号链接农场)。
+
+    用途:降级链用例需要精确控制哪些外部程序可见 —— mpv 与 ffmpeg 同处 /usr/bin 时,
+    按目录剔除无法构造「有 ffmpeg 无 mpv」;符号链接农场逐程序剔除即可。
+    """
+    farm = tempfile.mkdtemp(prefix="dlook-e2e-path-")
+    seen = set()
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d or not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            if name in progs or name in seen:
+                continue
+            src = os.path.join(d, name)
+            if os.access(src, os.X_OK) and not os.path.isdir(src):
+                try:
+                    os.symlink(src, os.path.join(farm, name))
+                    seen.add(name)
+                except OSError:
+                    pass
+    return farm
 
 
 def scenario_P():
@@ -1237,30 +1379,34 @@ def scenario_P():
         skip("P4 退出回收(mpv 子进程 + rc 0)", "同上:V4/V8 真实终端覆盖")
 
     # P5: 无 mpv(有 ffmpeg)→ 状态栏 mpv not found + ffmpeg 首帧静图(图片管线)
-    env = media_env(PATH=_path_without("mpv"))
+    env = media_env(PATH=_path_excluding("mpv"))
     s = PtySession(BIN + [clip], cols=80, rows=24, env=env, cwd=ROOT)
     s.start()
-    s.feed(3.0)
     task = panic_engine(s)
     if task:
         engine_skip("P5 无 mpv → ffmpeg 首帧静图", task)
         s.close()
     else:
-        txt = s.screen_text()
+        # 理由文案只在状态栏(1.5s TTL,静图成功后不再出现在 body)→ 尽早轮询捕获
+        txt = _wait_reason(s, "mpv not found")
         check("mpv not found" in txt, "P5 状态栏/信息行 mpv not found", txt[:80])
-        check(_half_rows(s), "P5 ffmpeg 首帧进入图片管线(半块字符)")
         check(
             not any("mpv" in c for c in _child_cmdlines(s.pid)),
             "P5 未 spawn mpv 子进程",
             str(_child_cmdlines(s.pid)),
         )
+        deadline = time.time() + 8
+        while time.time() < deadline and not _half_rows(s):
+            s.feed(0.2)
+        check(_half_rows(s), "P5 ffmpeg 首帧进入图片管线(半块字符)",
+              f"reason={bar_error(s)}")
         s.send_key("q")
         code = s.wait_exit(4)
         check(code == 0, f"P5 退出码 0 (got {code})")
         s.close()
 
     # P6: 无 mpv 且无 ffmpeg → 信息行(文件名/格式/原因)
-    env6 = media_env(PATH=_path_without("mpv", "ffmpeg"))
+    env6 = media_env(PATH=_path_excluding("mpv", "ffmpeg", "ffprobe"))
     s = PtySession(BIN + [clip], cols=80, rows=24, env=env6, cwd=ROOT)
     s.start()
     s.feed(2.5)
@@ -1277,16 +1423,16 @@ def scenario_P():
         check(code == 0, f"P6 退出码 0 (got {code})")
     s.close()
 
-    # P7: 有 mpv 但无图形协议(halfblocks)→ 同一降级链,且不 spawn mpv
+    # P7: 有 mpv 但无图形协议(halfblocks)→ 同一降级链,且不 spawn mpv;
+    # 理由文案在状态栏(1.5s TTL),故先趁早读文案,再断言首帧静图已渲染。
     env7 = media_env(PATH=os.environ.get("PATH", ""))
     s = PtySession(BIN + [clip], cols=80, rows=24, env=env7, cwd=ROOT)
     s.start()
-    s.feed(3.0)
     task = panic_engine(s)
     if task:
         engine_skip("P7 无图形协议 → 降级链", task)
     else:
-        txt = s.screen_text()
+        txt = _wait_reason(s, "graphics protocol", alt="mpv not found")
         check(
             "graphics protocol" in txt or "mpv not found" in txt,
             "P7 降级原因提示(无图形协议/mpv)",
@@ -1297,6 +1443,10 @@ def scenario_P():
             "P7 无协议时不启动 mpv",
             str(_child_cmdlines(s.pid)),
         )
+        deadline = time.time() + 8
+        while time.time() < deadline and not _half_rows(s):
+            s.feed(0.2)
+        check(_half_rows(s), "P7 首帧静图经图片管线渲染(半块字符)")
         s.send_key("q")
         code = s.wait_exit(4)
         check(code == 0, f"P7 退出码 0 (got {code})")
