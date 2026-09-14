@@ -172,12 +172,21 @@ KEYS = {
 
 
 class PtySession:
-    def __init__(self, argv, cols=80, rows=24, env=None, cwd=None):
+    def __init__(self, argv, cols=80, rows=24, env=None, cwd=None,
+                 feed_screen=True):
+        """`feed_screen=False` 只收集原始字节、不喂 pyte。
+
+        图形协议（sixel/kitty）的视频流每秒可达数十 MB，pyte 是纯 Python 解析器，
+        全量喂它会让读取线程跟不上 pty 写入速度 → 内核 pty 缓冲填满 → 被测进程被
+        背压阻塞 → 观察到的行为失真（实测 kitty 视频只测到 2 帧/2s，真实是 28fps）。
+        断言这类流量应直接用 self.raw。
+        """
         self.cols = cols
         self.rows = rows
         self.argv = argv
         self.env = dict(env or os.environ)
         self.cwd = cwd or os.getcwd()
+        self.feed_screen = feed_screen
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.Stream(self.screen)
         self.raw = bytearray()
@@ -229,6 +238,31 @@ class PtySession:
                 if self._exit_code is None:
                     self._reap(block=False)
                 continue
+            # 一次唤醒读干 pty 缓冲：图形协议场景（视频）单帧可达 MB 级，若每次只读
+            # 64KB 就跟不上写入速度，pty 缓冲填满 → 被测进程被背压阻塞 → 观察到的行为
+            # 失真（实测 kitty 视频只测到 2 帧/2s，而真实是 28fps）。
+            drained = False
+            while True:
+                try:
+                    data = os.read(self.fd, 262144)
+                except (BlockingIOError, InterruptedError):
+                    break
+                except OSError:
+                    drained = True
+                    break
+                if not data:
+                    drained = True
+                    break
+                self.raw.extend(data)
+                if self.feed_screen:
+                    try:
+                        self.stream.feed(data.decode("utf-8", errors="replace"))
+                    except Exception:
+                        pass
+            if drained:
+                break
+            continue
+            # --- 旧路径（保留为不可达，避免误改行为）---
             try:
                 data = os.read(self.fd, 65536)
             except OSError:

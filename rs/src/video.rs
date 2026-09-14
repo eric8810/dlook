@@ -60,15 +60,33 @@ const MAX_IPC_FAILURES: u32 = 5;
 /// 终端写入门的等待上限:超时则本次不写(下一轮重试),避免拖住 UI 事件循环。
 const GATE_TIMEOUT: Duration = Duration::from_millis(150);
 
-/// 终端写入门 + 载荷边界状态（见 `VideoCtx::acquire_tty`）。
+/// 终端写入门：保证「任何时刻只有一个写入者，且不在某帧内部」。
 ///
-/// `held` = 当前有写入者（可能是转发器正在写一条 sixel 载荷，也可能是 dlook 正在
-/// 写 chrome）。转发器在载荷开始前 acquire、载荷结束后 release，因此 dlook 的
-/// chrome 永远落在载荷边界上。
+/// **优先级**：转发器只在整个门空闲且**没有 dlook 写入者在等**时才开始写下一帧。
+/// 于是 dlook 的界面写入总能在「当前帧写完后」插进来，不会因终端慢（写 pty 阻塞）
+/// 或帧率高而被饿死 —— 这在 SSH（终端消费慢）场景下是必须的，否则媒体栏与按键
+/// 反馈会一直不更新。
 #[derive(Default)]
 struct Gate {
-    held: Mutex<bool>,
+    state: Mutex<GateState>,
     cv: Condvar,
+}
+
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
+enum Holder {
+    #[default]
+    None,
+    /// 转发器正在写 mpv 的一帧。
+    Forward,
+    /// dlook 正在写自己的界面。
+    Ui,
+}
+
+#[derive(Default)]
+struct GateState {
+    holder: Holder,
+    /// 有多少 dlook 写入者在等门（转发器据此让路）。
+    ui_waiting: u32,
 }
 
 /// 默认逻辑音量(与 AudioCtx 的 DEFAULT_VOLUME 一致;首次 start 前即可调整)。
@@ -111,15 +129,159 @@ pub enum VideoStatus {
 }
 
 
+/// 载荷/帧边界状态机（转发器用它决定「何时可以放门让 dlook 写界面」）。
+///
+/// 两种图形协议的结构差异（均为本机实测）：
+/// - **sixel**：一帧 = 一个 DCS 载荷（`ESC P` … `ESC \`）。
+/// - **kitty**：一帧 = N 个 APC 块（`ESC _ G` … `ESC \`），**只有最后一块 `m=0`**，
+///   其余 `m=1`；块与块背靠背（实测 470 块/帧，帧内非末块 m≠1 的数量为 0）。
+///
+/// 因此「一帧画完」= sixel 的 `ESC \` / kitty 的 `m=0` 块结束。只有此刻放门，
+/// dlook 的界面字节才不会被终端当成图形载荷的一部分。
+///
+/// 另：`ESC` 可能落在两次 read 的边界上，故状态里保留 `pending_esc`，避免漏判。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+enum PayloadState {
+    #[default]
+    Outside,
+    /// sixel DCS 载荷内。
+    Dcs,
+    /// kitty 帧内：`in_block` = 正在某个 APC 块内（否则在块之间，仍在同一帧）；
+    /// `header` 收集块头（到 `;` 为止）用于读 `m=`；`more` 表示还有后续块。
+    Kitty {
+        in_block: bool,
+        /// 刚进入 APC（`ESC _`）后期待引导字节 `G`；它不是参数。
+        expect_g: bool,
+        header: Vec<u8>,
+        more: bool,
+    },
+}
+
+#[derive(Debug, Default)]
+struct PayloadScanner {
+    state: PayloadState,
+    /// 上一个 chunk 的末尾是 ESC，需要与本 chunk 首个字节合看。
+    pending_esc: bool,
+}
+
+impl PayloadScanner {
+    /// 当前是否在载荷/帧内部（只读，不改变状态）。
+    ///
+    /// `pending_esc` 也算内部：读到 ESC 但还没看到下一个字节时，无法确定它是不是
+    /// 载荷开始（`ESC P` / `ESC _`）。此时若放门，dlook 的字节可能恰好插在载荷开头
+    /// 之后 —— 保守起见先不放，等本 chunk 处理完再判。
+    fn inside(&self) -> bool {
+        self.pending_esc || !matches!(self.state, PayloadState::Outside)
+    }
+
+    /// 喂入一个 chunk；返回处理完后是否仍在载荷/帧内部（true = 不能放门）。
+    fn feed(&mut self, chunk: &[u8]) -> bool {
+        for &b in chunk {
+            self.feed_byte(b);
+        }
+        self.inside()
+    }
+
+    fn feed_byte(&mut self, b: u8) {
+        if self.pending_esc {
+            self.pending_esc = false;
+            match (b, self.state.clone()) {
+                (b'P', PayloadState::Outside) => {
+                    self.state = PayloadState::Dcs;
+                    return;
+                }
+                (b'_', PayloadState::Outside)
+                | (
+                    b'_',
+                    PayloadState::Kitty {
+                        in_block: false, ..
+                    },
+                ) => {
+                    // 帧内新块开始（块与块背靠背，实测块间空隙为 0 或几字节的光标序列）
+                    self.state = PayloadState::Kitty {
+                        in_block: true,
+                        expect_g: true,
+                        header: Vec::new(),
+                        more: true,
+                    };
+                    return;
+                }
+                (b'\\', PayloadState::Dcs) => {
+                    self.state = PayloadState::Outside;
+                    return;
+                }
+                (b'\\', PayloadState::Kitty { in_block: true, more, .. }) => {
+                    self.state = if more {
+                        PayloadState::Kitty {
+                            in_block: false,
+                            expect_g: false,
+                            header: Vec::new(),
+                            more: true,
+                        }
+                    } else {
+                        PayloadState::Outside
+                    };
+                    return;
+                }
+                (_, _) => {} // 普通转义序列的 ESC，继续按状态处理本字节
+            }
+        }
+        match &mut self.state {
+            PayloadState::Outside | PayloadState::Dcs => {
+                if b == 0x1b {
+                    self.pending_esc = true;
+                }
+            }
+            PayloadState::Kitty {
+                in_block,
+                expect_g,
+                header,
+                more,
+            } => {
+                if !*in_block {
+                    if b == 0x1b {
+                        self.pending_esc = true;
+                    }
+                    return;
+                }
+                if *expect_g {
+                    // `ESC _ G` 的 G：kitty 协议的引导字节，不属于参数
+                    *expect_g = false;
+                    if b == b'G' {
+                        return;
+                    }
+                }
+                if b == 0x1b {
+                    self.pending_esc = true;
+                    return;
+                }
+                // 块头：读到 ';' 为止，解析 m=（缺省视为还有后续，保守不放门）
+                if header.last() != Some(&b';') {
+                    if b == b';' {
+                        let text = String::from_utf8_lossy(header).to_string();
+                        *more = text
+                            .split(',')
+                            .find_map(|kv| kv.strip_prefix("m="))
+                            .and_then(|v| v.chars().next())
+                            .map(|c| c != '0')
+                            .unwrap_or(true);
+                        header.clear();
+                        header.push(b';');
+                    } else if header.len() < 128 {
+                        header.push(b);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// dlook 唯一写入者的前提：把 mpv 的像素输出经管道转发到终端。
 ///
-/// 返回值 = (写入门, 转发线程句柄)。线程做的事：
-///   1. 从 mpv stdout 读字节
-///   2. 写终端前 acquire 门，并跟踪 sixel 载荷边界（ESC P..ESC \）；**载荷中间不放门**
-///   3. EOF 时若停在载荷中间，补一个终止符，避免终端停在 DCS 状态吞掉后续 chrome
-///
-/// 于是 dlook 的 chrome 写入（acquire_tty）只会落在载荷边界，任何时刻都只有一个
-/// 写入者、且不在载荷内部 —— 这取代了「暂停 mpv 再写」的不安全做法。
+/// 线程做的事：读 mpv stdout → 帧外取门 → 写终端 → 帧末放门。门在帧内保持持有，
+/// 因此 dlook 的界面写入（acquire_tty）只会落在帧边界上：任何时刻只有一个写入者、
+/// 且不在某一帧内部。这取代了「暂停 mpv 再写」的不安全做法（实测：暂停可能停在
+/// 载荷中间，仍会撕裂）。
 fn spawn_forwarder(
     mut from_mpv: impl Read + Send + 'static,
     gate: Arc<Gate>,
@@ -129,7 +291,7 @@ fn spawn_forwarder(
         .spawn(move || {
             let mut out = std::io::stdout();
             let mut buf = vec![0u8; 64 * 1024];
-            let mut inside = false;
+            let mut scanner = PayloadScanner::default();
             loop {
                 let n = match from_mpv.read(&mut buf) {
                     Ok(0) => break,
@@ -137,57 +299,35 @@ fn spawn_forwarder(
                     Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
-                if !inside {
-                    // 载荷（或普通字节）开始前取门：保证 dlook 不会插进来
-                    let mut held = gate.held.lock().unwrap_or_else(PoisonError::into_inner);
-                    while *held {
-                        held = gate.cv.wait(held).unwrap_or_else(PoisonError::into_inner);
+                if !scanner.inside() {
+                    let mut st = gate.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    while st.holder != Holder::None || st.ui_waiting > 0 {
+                        st = gate.cv.wait(st).unwrap_or_else(PoisonError::into_inner);
                     }
-                    *held = true;
+                    st.holder = Holder::Forward;
                 }
                 let _ = out.write_all(&buf[..n]);
                 let _ = out.flush();
-                inside = scan_inside_payload(&buf[..n], inside);
-                if !inside {
-                    let mut held = gate.held.lock().unwrap_or_else(PoisonError::into_inner);
-                    *held = false;
+                if !scanner.feed(&buf[..n]) {
+                    let mut st = gate.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    if st.holder == Holder::Forward {
+                        st.holder = Holder::None;
+                    }
                     gate.cv.notify_all();
                 }
             }
-            if inside {
-                // 截断的载荷：补终止符，别让终端停在 DCS 状态
+            if matches!(scanner.state, PayloadState::Dcs) {
+                // sixel 截断：补终止符，别让终端停在 DCS 状态
                 let _ = out.write_all(b"\x1b\\");
                 let _ = out.flush();
             }
-            let mut held = gate.held.lock().unwrap_or_else(PoisonError::into_inner);
-            *held = false;
+            let mut st = gate.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if st.holder == Holder::Forward {
+                st.holder = Holder::None;
+            }
             gate.cv.notify_all();
         })
-        .unwrap_or_else(|_| {
-            // 线程起不来：返回一个空句柄（门保持空闲，退化为"直接写"）
-            std::thread::spawn(|| {})
-        })
-}
-
-/// 跟踪 sixel DCS 状态：返回处理完 `chunk` 后是否仍在载荷内部。
-/// 载荷 = `ESC P` 开始、`ESC \`（ST）结束；载荷内部不再嵌套 DCS。
-fn scan_inside_payload(chunk: &[u8], mut inside: bool) -> bool {
-    let mut i = 0;
-    while i < chunk.len() {
-        if !inside {
-            if chunk[i] == 0x1b && chunk.get(i + 1) == Some(&b'P') {
-                inside = true;
-                i += 2;
-                continue;
-            }
-        } else if chunk[i] == 0x1b && chunk.get(i + 1) == Some(&b'\\') {
-            inside = false;
-            i += 2;
-            continue;
-        }
-        i += 1;
-    }
-    inside
+        .unwrap_or_else(|_| std::thread::spawn(|| {}))
 }
 
 /// 终端写入安全窗口（见 `VideoCtx::begin_write`）。
@@ -997,26 +1137,32 @@ impl VideoCtx {
             return Ok(());
         };
         let deadline = Instant::now() + GATE_TIMEOUT;
-        let mut held = gate.held.lock().unwrap_or_else(PoisonError::into_inner);
-        while *held {
+        let mut st = gate.state.lock().unwrap_or_else(PoisonError::into_inner);
+        st.ui_waiting += 1;
+        let got = loop {
+            if st.holder == Holder::None {
+                st.holder = Holder::Ui;
+                break true;
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(());
+                break false;
             }
-            let (g, timeout) = gate
+            let (g, _) = gate
                 .cv
-                .wait_timeout(held, left)
+                .wait_timeout(st, left)
                 .unwrap_or_else(PoisonError::into_inner);
-            held = g;
-            if timeout.timed_out() && *held {
-                return Err(());
-            }
+            st = g;
+        };
+        st.ui_waiting -= 1;
+        if got {
+            Ok(())
+        } else {
+            gate.cv.notify_all();
+            Err(())
         }
-        *held = true;
-        Ok(())
     }
 
-    /// 释放「终端写入窗口」（见 `acquire_tty`）。
     fn release_tty(&self) {
         let gate = {
             let inner = self.shared.lock();
@@ -1026,8 +1172,10 @@ impl VideoCtx {
             }
         };
         if let Some(gate) = gate {
-            let mut held = gate.held.lock().unwrap_or_else(PoisonError::into_inner);
-            *held = false;
+            let mut st = gate.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if st.holder == Holder::Ui {
+                st.holder = Holder::None;
+            }
             gate.cv.notify_all();
         }
     }
@@ -1474,6 +1622,56 @@ impl VideoCtx {
 // ---------------------------------------------------------------------------
 // 测试(真实 mpv 子进程;E14 结论断言;消融对照)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod payload_scanner_tests {
+    use super::*;
+
+    fn scan(chunks: &[&[u8]]) -> Vec<bool> {
+        let mut sc = PayloadScanner::default();
+        chunks.iter().map(|c| sc.feed(c)).collect()
+    }
+
+    #[test]
+    fn sixel_frame_is_one_dcs() {
+        assert_eq!(scan(&[b"\x1bPq#0;2;0;0;0AAA\x1b\\"]), vec![false]);
+        assert_eq!(scan(&[b"\x1bPqAAA", b"BBB"]), vec![true, true]);
+        assert_eq!(scan(&[b"\x1bPqAAA", b"BBB\x1b\\"]), vec![true, false]);
+    }
+
+    #[test]
+    fn kitty_frame_is_blocks_until_m0() {
+        let mid = b"\x1b_Gm=1;AAAA\x1b\\";
+        let last = b"\x1b_Gm=0;BBBB\x1b\\";
+        let mut sc = PayloadScanner::default();
+        assert!(sc.feed(mid), "第一块后仍在帧内");
+        assert!(sc.feed(mid), "第二块后仍在帧内");
+        assert!(!sc.feed(last), "m=0 块结束 → 帧结束，可放门");
+    }
+
+    #[test]
+    fn kitty_missing_m_parameter_stays_inside() {
+        let mut sc = PayloadScanner::default();
+        assert!(sc.feed(b"\x1b_Gi=1;AAAA\x1b\\"), "无 m= 时保守处理：不放门");
+    }
+
+    #[test]
+    fn esc_split_across_chunks_is_not_missed() {
+        let mut sc = PayloadScanner::default();
+        assert!(sc.feed(b"\x1b"), "只有 ESC：视为可能开始");
+        assert!(sc.feed(b"PqAAA"), "ESC + P → sixel 帧内");
+        assert!(sc.feed(b"\x1b"), "帧内 ESC：可能结束");
+        assert!(!sc.feed(b"\\"), "ESC + \\ → 帧结束");
+    }
+
+    #[test]
+    fn ordinary_sequences_do_not_open_a_frame() {
+        let mut sc = PayloadScanner::default();
+        assert!(!sc.feed(b"\x1b[2;2f"));
+        assert!(!sc.feed(b"\x1b[1;1H\x1b[1mhello\x1b[0m"));
+        assert!(!sc.feed(b"\x1b]0;title\x07"));
+    }
+}
 
 #[cfg(test)]
 mod tests {
