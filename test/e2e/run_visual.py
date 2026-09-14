@@ -3,7 +3,8 @@
 
 入口是 `test/e2e/run-visual.sh`（负责绝对路径定位被测二进制、图形会话与工具
 前置检查、缺依赖时显式 SKIP）。参考 experiments：`e11-visual-video-check.py`
-（四态截图断言）、`e13-terminal-loop-check.py`（窗口聚焦 / wtype 注入 / 退出码读回）。
+（四态截图断言）—— 注意：早期版本靠 wtype 注入按键，而 Wayland 注入必须聚焦窗口，
+会抢用户焦点；现在按键交互全部移到 run_acceptance.py 场景 S（纯 pty，无窗口影响）。
 
 覆盖：
   V1  图片渲染可见（sixel 亮色内容 vs 同几何文本基线）
@@ -194,59 +195,12 @@ def window_count():
 
 
 def active_window_ident():
-    """当前活动窗口的**唯一地址**（Hyprland address）——用于注入后还原焦点。
-
-    必须用 address：按 class 匹配会命中同类窗口中的任意一个（本机有多个 foot 窗口，
-    实测按 class 还原会切到别的 foot）。返回 None 表示取不到。
-    """
+    """当前活动窗口地址——本套件用它做「全程未改变焦点」的自检。"""
     try:
         c = json.loads(sh(["hyprctl", "activewindow", "-j"]).stdout)
         return c.get("address") or None
     except Exception:  # noqa: BLE001
         return None
-
-
-def focus(tag):
-    """聚焦测试窗口以注入按键，返回「之前的活动窗口」供调用方恢复。
-
-    wtype 只能把按键送给**当前聚焦**的 Wayland 表面，因此注入前必须聚焦测试窗口；
-    若注入后不还原，用户的焦点会被反复抢走。调用方应在注入完成后调用
-    `restore_focus(prev)` 把焦点还给用户原来的窗口。
-    """
-    prev = active_window_ident()
-    r = sh(["hyprctl", "dispatch", f'hl.dsp.focus({{window="class:{tag}"}})'])
-    if r.returncode != 0 or "ok" not in (r.stdout + r.stderr).lower():
-        sh(["hyprctl", "dispatch", "focuswindow", f"class:{tag}"])
-    time.sleep(0.4)
-    return prev
-
-
-def is_test_window(address):
-    """该地址是否属于本次 V 套件的测试窗口（是则不必还原焦点）。"""
-    if not address:
-        return False
-    for c in hypr_clients():
-        if c.get("address") == address:
-            blob = c.get("title", "") + c.get("class", "")
-            return TAG_PREFIX in blob
-    return False
-
-
-def restore_focus(prev):
-    """把焦点还给 `focus()` 之前的窗口（按 address 精确定位，用户自己的窗口）。
-
-    连续注入时若上一个窗口本就是测试窗口，则不必来回切。失败静默——焦点还原不该
-    让测试挂掉。
-    """
-    if not prev or is_test_window(prev):
-        return
-    sh(["hyprctl", "dispatch", f'hl.dsp.focus({{window="address:{prev}"}})'])
-
-
-def key(*keys):
-    r = sh(["wtype", "-k", *keys])
-    time.sleep(0.35)
-    return r
 
 
 # --------------------------------------------------------------------------
@@ -617,15 +571,16 @@ class Session:
                   f"{self.geo['size'][1]} @ {tuple(self.geo['at'])}")
 
     def _raise(self):
-        """截图前把测试窗口置顶，返回之前的活动窗口（截图后还原焦点）。
+        """把测试窗口提到 z 序最上层——**不改变焦点**。
 
-        置顶是必要的（否则并行的其他浮动窗口会盖在被截区域上，OCR 串味）；但不需要
-        持续聚焦——故 `_grab` 在 grim 完成后立刻把焦点还给用户。
+        `alter_zorder` 只动叠放次序；早期用 focus 置顶会把用户的焦点抢到测试窗口，
+        注入按键时还会截走用户正在敲的键（用户实测反馈）。按键交互已移出本套件
+        （见 run_acceptance.py 场景 S，纯 pty），这里不再需要聚焦。
+        取不到 alter_zorder 时静默跳过：截到被遮挡的窗口会体现为断言失败，可自查。
         """
-        prev = active_window_ident()
-        sh(["hyprctl", "dispatch", f'hl.dsp.focus({{window="class:{self.tag}"}})'])
-        time.sleep(0.25)
-        return prev
+        sh(["hyprctl", "dispatch",
+            f'hl.dsp.window.alter_zorder({{mode="top", window="class:{self.tag}"}})'])
+        time.sleep(0.2)
 
     def rc(self):
         if os.path.exists(self.rc_path):
@@ -638,16 +593,14 @@ class Session:
     # ---- 截图 / 按键 ----
     def _grab(self, name, tag_suffix=""):
         """单次截图（窗口当前几何）；返回 (path, size) 或 (None, None)。"""
-        prev = self._raise()
+        self._raise()
         c = find_window(self.tag)
         if not c:
-            restore_focus(prev)
             return None, None
         x, y = c["at"]
         w, h = c["size"]
         path = os.path.join(self.dir, f"{name}{tag_suffix}.png")
         sh(["grim", "-g", f"{x},{y} {w}x{h}", path])
-        restore_focus(prev)  # 截图完成 → 焦点还给用户
         DIMS.pop(path, None)
         _CACHE.pop(path, None)
         return path, png_size(path)
@@ -701,27 +654,23 @@ class Session:
         a = Anchor(path, self.rows)
         return a if a.ok else None
 
-    def send(self, *keys):
-        # 注入按键需要聚焦测试窗口；注入后立刻把焦点还给用户原来的窗口
-        # （否则连续注入会把用户的焦点一直抢在测试窗口上）。
-        prev = focus(self.tag)
-        try:
-            return key(*keys)
-        finally:
-            restore_focus(prev)
+    # 注：本套件**不注入按键**。Wayland 下 wtype 只能发给聚焦窗口，必然抢用户焦点；
+    # 交互验证改在 run_acceptance.py 场景 S（纯 pty，按键直接写 pty master）。
 
     def quit(self, timeout=8.0):
-        """注入 q，返回退出码或 None（注入失败则 SIGTERM 兜底）。"""
-        self.send("q")
+        """关掉测试窗口（不注入按键），返回退出码（若包装脚本写回了 rc 文件）。
+
+        窗口关闭 → 会话收到 SIGHUP → dlook 退出；这与用户按 q 的清理路径不同，
+        故本套件的断言只看「进程/窗口无残留」，退出码由 pty 套件负责。
+        """
+        sh(["hyprctl", "dispatch", f'hl.dsp.window.close({{window="class:{self.tag}"}})'])
         deadline = time.time() + timeout
-        while time.time() < deadline and self.rc() is None:
+        while time.time() < deadline:
+            if find_window(self.tag) is None:
+                break
             time.sleep(0.2)
-        rc = self.rc()
-        if rc is None and self.proc.poll() is None:
-            self.proc.terminate()
-            time.sleep(0.8)
-            rc = self.rc()
-        return rc
+        time.sleep(0.3)
+        return self.rc()
 
     def close(self):
         try:
@@ -815,6 +764,11 @@ def calibrate():
         diffs = sorted(b - a for a, b in zip(tops, tops[1:]) if 10 <= b - a <= 60)
         if len(lines) < 10 or not diffs:
             print(f"  (calib) OCR 行不足（{len(lines)} 行）→ 无法标定绝对行带")
+            # 诊断：把标定截图留下并报告它的实际内容，避免「全轮 SKIP 但不知为何」
+            st = region_stats(shot, 0, size[1], 0, size[0]) if shot else None
+            print(f"  (calib) 诊断: 截图 {size[0]}x{size[1]} 文件 {shot} "
+                  f"ink={st['ink'] if st else 'n/a'} quant={st['quant'] if st else 'n/a'}"
+                  f"；若 ink≈0 说明截到了空白（窗口被遮挡/未映射）")
             return False
         pitch = float(diffs[len(diffs) // 2])
         row0_center = (lines[0][0] + lines[0][1]) / 2
@@ -1048,25 +1002,6 @@ def v2_video(s):
     check(nonzero(d_play) and d_play > 0.001, "V2 播放中视频区帧变化",
           f"diff={d_play}（{n} 次采样取最大）")
 
-    s.send("space")  # M1: 播放/暂停
-    time.sleep(1.0)
-    d_pause, n, _ = diff_over_pairs(s, "pause-1", "pause-2", body, gap=1.2, want="min")
-    check(d_pause == 0.0, "V2 暂停后视频区冻结（逐像素一致）",
-          f"diff={d_pause}（{n} 次采样取最小）")
-
-    s.send("space")
-    time.sleep(1.0)
-    d_resume, n, _ = diff_over_pairs(s, "resume-1", "resume-2", body, gap=1.2, want="max")
-    check(nonzero(d_resume) and d_resume > 0.001, "V2 恢复播放后视频区再次变化",
-          f"diff={d_resume}（{n} 次采样取最大）")
-
-    s.send("Right")  # seek +5s
-    time.sleep(1.0)
-    d_seek, n, _ = diff_over_pairs(s, "seek-1", "seek-2", body, gap=0.4, want="max")
-    check(nonzero(d_seek) and d_seek > 0.0005, "V2 seek 后画面变化",
-          f"diff={d_seek}（{n} 次采样取最大）")
-
-
 def v3_coscreen(s):
     print("== V3 视频共屏：chrome 仍在 / 视频区未被文字覆写 ==")
     shot = s.shot("coscreen")
@@ -1137,12 +1072,8 @@ def v3b_live_refresh(s):
           "V3b 媒体栏随播放刷新（时间码/进度条变化）",
           f"bar diff={d}（{n} 次采样取最大；0 = 时间码冻结）")
 
-    # b) 播放中按 → 必须有可见反馈（状态栏消息）
-    s.send("Right")
-    time.sleep(0.6)
-    seek_shot = fresh("live-seek")
-    txt = ocr(seek_shot) if seek_shot else ""
-    check("seek" in txt.lower(), "V3b 播放中 seek 有可见反馈", txt.strip()[-60:])
+    # 注：播放中按键反馈（媒体栏/状态栏刷新）已移到 pty 场景 S5 验证——
+    # 本套件不注入按键（Wayland 注入必须聚焦，会抢用户焦点）。
 
     # c) resize 后 chrome 必须恢复，且无旧内容残留
     subprocess.run(["hyprctl", "dispatch",
@@ -1190,8 +1121,6 @@ def v5_audio():
         s.close()
         return
 
-    s.send("0")  # 回曲首（确定性起点）
-    time.sleep(0.6)
     a = s.shot("play-1")
     anchor = s.anchor_for("play-1")
     if a is None or anchor is None:
@@ -1221,8 +1150,6 @@ def v5_audio():
                             png_size(a)[0], bd["body"][1] - bd["body"][0]))
         check("state" in body_txt and "playing" in body_txt,
               "V5 body 信息块含播放态", body_txt.strip().replace("\n", " | ")[:70])
-
-    s.send("p")
     time.sleep(0.6)
     d_pause, n, pair = diff_over_pairs(s, "pause-1", "pause-2", bd["bar"], gap=1.4,
                                        want="min")
@@ -1239,7 +1166,6 @@ def v5_audio():
 
     # 恢复播放断言：8s fixture 在「就绪等待 + 前两段采样」后已接近末尾，先回曲首。
     # media.rs 的 restart(`0`) 语义 = seek 0 + play，故**不再按 p**（否则又暂停）。
-    s.send("0")
     time.sleep(0.8)
     d_resume, n, _ = diff_over_pairs(s, "resume-1", "resume-2", bd["bar"], gap=1.2,
                                      want="max")
@@ -1289,7 +1215,7 @@ def install_signal_cleanup():
 
 
 def preflight():
-    problems = [t for t in ("hyprctl", "grim", "foot", "wtype", "magick", "tesseract")
+    problems = [t for t in ("hyprctl", "grim", "foot", "magick", "tesseract")
                 if not shutil.which(t)]
     if not os.environ.get("WAYLAND_DISPLAY"):
         problems.append("WAYLAND_DISPLAY(非图形会话)")
@@ -1315,6 +1241,8 @@ def preflight():
 
 def main():
     install_signal_cleanup()
+    # 本套件承诺**不改变用户焦点**：全程比对活动窗口，变了就判失败（自己的 bug 要暴露）
+    focus_before = active_window_ident()
     if not preflight():
         print()
         print(f"RESULT: PASS={PASS} FAIL={FAIL} SKIP={SKIP}")
@@ -1337,6 +1265,12 @@ def main():
         v5_audio()
     finally:
         final_cleanup()
+
+    focus_after = active_window_ident()
+    if focus_before and focus_after:
+        check(focus_before == focus_after,
+              "套件全程未改变用户焦点（不抢焦点的自检）",
+              f"{focus_before} → {focus_after}")
 
     print()
     print(f"RESULT: PASS={PASS} FAIL={FAIL} SKIP={SKIP}")
