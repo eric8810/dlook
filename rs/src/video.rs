@@ -96,6 +96,15 @@ pub enum VideoStatus {
     Failed(String),
 }
 
+/// 终端写入安全窗口（见 `VideoCtx::begin_write`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteWindow {
+    /// 现在可以安全写终端；`resume` 为 true 时写完后须调 `end_write(true)` 恢复播放。
+    Safe { resume: bool },
+    /// mpv 正在输出且无法暂停：放弃本次写入（否则会撕裂画面）。
+    Busy,
+}
+
 #[derive(Debug, Clone)]
 pub struct VideoSnapshot {
     pub status: VideoStatus,
@@ -598,6 +607,78 @@ impl VideoCtx {
             } else {
                 VideoStatus::Playing
             };
+        }
+        let _ = refresh_playback(session);
+        drop(inner);
+        self.shared.bump_dirty();
+    }
+
+    /// 显式暂停（幂等）。供集成层取「安全写入窗口」：mpv 暂停时**不再输出**
+    /// sixel/kitty 载荷（实测：pause=true 后 0.5s 窗口内输出字节从 ~260KB 降到 0），
+    /// 此刻 dlook 写自己的 chrome 不会插进 mpv 的转义流中间。
+    ///
+    /// 返回 true 表示「本次调用真的让它从播放变为暂停」（调用方据此决定是否恢复）。
+    /// 取「写入安全窗口」：只有本方法返回 `Safe` 时，调用方才可以写终端。
+    ///
+    /// 不变量：**dlook 只在 mpv 不输出字节时写入**。实测依据：
+    /// - mpv 播放时每 0.5s 输出 ~260KB sixel 载荷（帧流几乎无间隙）；
+    /// - `set_property pause true` 后输出立即归零（0.5s 窗口内 0 字节），恢复后立刻回升。
+    ///
+    /// 因此安全窗口 = 无会话 / mpv 已退出 / mpv 已暂停 / **本次成功暂停了 mpv**
+    /// （返回 `Safe { resume: true }`，调用方写完后须调 `end_write`）。
+    ///
+    /// `Busy` 表示 mpv 正在输出且此刻无法暂停（IPC 未就绪、失联等）——此时**必须放弃
+    /// 本次写入**；否则字节会插进在途的转义序列中间，终端把残余载荷当文本打印
+    /// （V 套件与独立验收 media-4 的 B2 均实测到该撕裂）。
+    pub fn begin_write(&self) -> WriteWindow {
+        let mut inner = self.shared.lock();
+        let session = match &mut inner.state {
+            State::Idle | State::Failed(_) => return WriteWindow::Safe { resume: false },
+            State::Live(session) => session,
+        };
+        if session.child.is_none() {
+            // mpv 已退出（退出时已发 `\033_Ga=d` 清图）：它不再输出，写入安全
+            return WriteWindow::Safe { resume: false };
+        }
+        if session.paused {
+            return WriteWindow::Safe { resume: false };
+        }
+        let Some(ipc) = session.ipc.as_mut() else {
+            return WriteWindow::Busy; // 子进程在跑但 IPC 未就绪 → 可能正在输出
+        };
+        if ipc.set_property("pause", Json::Bool(true)).is_ok() {
+            session.paused = true;
+            session.status = VideoStatus::Paused;
+            let _ = refresh_playback(session);
+            drop(inner);
+            self.shared.bump_dirty();
+            return WriteWindow::Safe { resume: true };
+        }
+        WriteWindow::Busy
+    }
+
+    /// 结束写入安全窗口；`resume` 为 `begin_write` 给出的值，true 时恢复播放。
+    pub fn end_write(&self, resume: bool) {
+        if resume {
+            self.play();
+        }
+    }
+
+    /// 显式恢复播放（幂等）。与 `pause` 配对使用，见其文档。
+    pub fn play(&self) {
+        let mut inner = self.shared.lock();
+        let State::Live(session) = &mut inner.state else {
+            return;
+        };
+        if session.child.is_none() || !session.paused {
+            return;
+        }
+        let Some(ipc) = session.ipc.as_mut() else {
+            return;
+        };
+        if ipc.set_property("pause", Json::Bool(false)).is_ok() {
+            session.paused = false;
+            session.status = VideoStatus::Playing;
         }
         let _ = refresh_playback(session);
         drop(inner);

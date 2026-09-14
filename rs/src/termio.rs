@@ -19,7 +19,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::execute;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, ClearType, CrosstermBackend};
 use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -38,7 +38,7 @@ use crate::markdown;
 use crate::media::{AudioCtx, AudioSnapshot, AudioStatus};
 use crate::mermaid;
 use crate::selection;
-use crate::video::{TermProto, VideoArea, VideoCtx, VideoSnapshot, VideoStatus};
+use crate::video::{TermProto, VideoArea, VideoCtx, VideoSnapshot, VideoStatus, WriteWindow};
 use crate::viewport::Viewport;
 use crate::web;
 
@@ -526,6 +526,13 @@ struct MediaState {
     /// 视频会话生命周期相位（0 Loading/1 播放或暂停/2 结束/3 失败/255 无会话）。
     /// 只在相位变化时清屏重绘，避免打断 mpv 的图像流（见 video_lifecycle_changed）。
     video_phase: u8,
+    /// 集成层请求一次 chrome 写入（用户操作 / resize / 会话事件）。
+    ///
+    /// 视频活跃期间 dlook 不能随时写终端（会插进 mpv 的转义流 → 撕裂），只有在
+    /// 「安全窗口」（先暂停 mpv，写，再恢复）里写。该标记让事件循环知道「有一件
+    /// 必须让用户看到的变化发生了」，从而取一次安全窗口；正常播放 tick 不置位，
+    /// 因此不会每秒反复暂停（见事件循环里的 want_write）。
+    need_write: bool,
 }
 
 impl MediaState {
@@ -548,6 +555,7 @@ impl MediaState {
             probe_text: None,
             degrade_reason: String::new(),
             video_phase: 255,
+            need_write: false,
         }
     }
 
@@ -871,6 +879,22 @@ impl MediaState {
     /// 记录当前相位（清屏之后调用）。
     fn sync_video_phase(&mut self) {
         self.video_phase = self.video_phase_now();
+    }
+
+    /// 标记「有一次必须让用户看到的 chrome 变化」；事件循环据此取一次安全窗口写入。
+    fn mark_need_write(&mut self) {
+        self.need_write = true;
+    }
+
+    /// 是否有待写的 chrome 变化（只读，不清除；清除由 `clear_need_write` 在真正写成后调用，
+    /// 这样 `Busy` 时标记得以保留、下一轮重试）。
+    fn peek_need_write(&self) -> bool {
+        self.need_write
+    }
+
+    /// 清除待写标记（确实写入终端之后调用）。
+    fn clear_need_write(&mut self) {
+        self.need_write = false;
     }
 
     /// 刷新 Mode::Audio 的 body 信息块。
@@ -1314,7 +1338,7 @@ fn event_loop(
             media.start_video(&nav.path, w, h, proto, img_ctx.cell_pixel_size());
             if media.video_active {
                 // mpv 启动会清空终端图像(研究 §已知坑:\033_Ga=d)→ 全量重绘
-                let _ = terminal.clear();
+                let _ = terminal.backend_mut().clear_region(ClearType::All);
             } else {
                 let reason = media.degrade_reason.clone();
                 ui.say(reason);
@@ -1333,34 +1357,56 @@ fn event_loop(
     let exit_code = loop {
         children.retain_mut(|c| c.try_wait().map(|r| r.is_none()).unwrap_or(false));
 
-        // 视频共屏的关键约束:mpv 用 sixel/kitty **转义序列**画 body 区,与 dlook 自己的
-        // 输出共用同一条 tty 写流。若 dlook 在 mpv 流式输出期间写入(哪怕只是重绘
-        // header/footer 的 diff),字节会插进 mpv 的转义序列中间,终端把残余载荷当文本
-        // 打印 → 满屏乱码并覆盖 chrome(V 套件实测的撕裂现象)。
+        // 视频共屏的写入约束（不变量）：dlook 只在 **mpv 不输出时** 写自己的 chrome。
         //
-        // 因此:mpv 会话活跃期间 **dlook 完全不写终端**(既不清屏也不 draw),
-        // 只在视频生命周期相位变化的那一拍统一写一次 chrome(那一刻 mpv 正在启动或
-        // 已退出,其转义流未在途,写入是安全的;mpv 启动/退出各发一次 `\033_Ga=d`
-        // 清空终端全部图像,故相位变化时全量重绘)。
-        let video_phase = media.video_phase_now();
-        let mpv_owns_tty = video_phase == 1; // Playing/Paused:mpv 正在画
-        let phase_changed = media.video_phase() != video_phase;
-        if phase_changed {
-            media.sync_video_phase();
-            let _ = terminal.clear();
-        }
-        if !mpv_owns_tty || phase_changed {
-            let view = media.view();
-            let _ = terminal.draw(|f| {
-                render_frame(
-                    f,
-                    doc,
-                    &nav.path,
-                    &mut ui,
-                    &view,
-                    !nav.history.is_empty(),
-                )
-            });
+        // 背景：mpv 用 sixel/kitty 转义序列画 body 区，与 dlook 共用同一条 tty 写流；
+        // 若 dlook 的字节插进 mpv 在途的转义序列中间，终端会把残余载荷当文本打印 →
+        // 满屏乱码并覆盖 chrome（V 套件实测）。
+        //
+        // 但「mpv 活跃期间一律不写」是错的（独立验收 media-4 的 B1：媒体栏时间码冻结、
+        // 按键反馈全丢、resize 后 chrome 永不恢复）。实测发现安全窗口：
+        // **mpv 暂停时不输出任何字节**（pause=true 后 0.5s 窗口输出从 ~260KB 降到 0），
+        // 所以「需要写时先暂停 mpv → 写 → 恢复播放」既无撕裂也不丢反馈。
+        // 正常播放的 tick 不触发写入（不会每秒反复暂停导致卡顿）。
+        // 注意「相位 != 播放」**不等于**可以写：mpv 重启（resize → set_area）期间新进程
+        // 已经在画帧，此时写入同样会撕裂（独立验收 media-4 的 B2）。唯一可靠的判据是
+        // VideoCtx::begin_write()——它只在确认 mpv 不输出时返回 Safe。
+        let phase_changed = media.video_phase() != media.video_phase_now();
+        // 需要写的情形：非视频会话 / 相位变化（mpv 启动或退出发 \033_Ga=d 清屏）/
+        // 集成层标记了待写（用户操作、resize、会话事件）。正常播放的 tick 不置位，
+        // 因此不会每 200ms 反复暂停（不会影响播放流畅度）。
+        let want_write = !media.video_active || phase_changed || media.peek_need_write();
+        if want_write {
+            let window = if media.video_active {
+                media.video.begin_write()
+            } else {
+                WriteWindow::Safe { resume: false }
+            };
+            match window {
+                WriteWindow::Safe { resume } => {
+                    if phase_changed {
+                        media.sync_video_phase();
+                        let _ = terminal.backend_mut().clear_region(ClearType::All);
+                    }
+                    let view = media.view();
+                    let _ = terminal.draw(|f| {
+                        render_frame(
+                            f,
+                            doc,
+                            &nav.path,
+                            &mut ui,
+                            &view,
+                            !nav.history.is_empty(),
+                        )
+                    });
+                    if media.video_active {
+                        media.video.end_write(resume);
+                    }
+                    media.clear_need_write();
+                }
+                // mpv 正在输出且无法暂停：保留待写标记，下一轮再试（不冒撕裂风险）
+                WriteWindow::Busy => {}
+            }
         }
 
         // 用 poll 非阻塞检查终端事件(200ms 超时兼作热重载轮询周期)
@@ -1427,22 +1473,27 @@ fn event_loop(
                         Action::PlayPause => {
                             media.toggle_pause();
                             say_playback_state(&mut ui, &media);
+                            media.mark_need_write();
                         }
                         Action::Seek(d) => {
                             media.seek_by(d);
                             say_seek(&mut ui, &media, d);
+                            media.mark_need_write();
                         }
                         Action::Volume(d) => {
                             media.adjust_volume(d);
                             say_volume(&mut ui, &media);
+                            media.mark_need_write();
                         }
                         Action::ToggleMute => {
                             media.toggle_mute();
                             say_volume(&mut ui, &media);
+                            media.mark_need_write();
                         }
                         Action::Restart => {
                             media.restart();
                             ui.say("restart");
+                            media.mark_need_write();
                         }
                         Action::OpenBrowser => {
                             let url = media.browser_url(&nav.path);
@@ -1473,10 +1524,12 @@ fn event_loop(
                         MouseAction::PlayPause => {
                             media.toggle_pause();
                             say_playback_state(&mut ui, &media);
+                            media.mark_need_write();
                         }
                         MouseAction::ToggleMute => {
                             media.toggle_mute();
                             say_volume(&mut ui, &media);
+                            media.mark_need_write();
                         }
                         MouseAction::Volume(d) => {
                             media.adjust_volume(d);
@@ -1501,12 +1554,17 @@ fn event_loop(
                 Ok(Event::Resize(w, h)) => {
                     // 重排后行结构变化,内容坐标失效 → 清除选区
                     ui.sel = None;
-                    // 视频区几何变化 → 重算 area 并调 set_area + 全量重绘(design §5.3)
+                    // 视频区几何变化 → 重算 area 并调 set_area(design §5.3)。
+                    //
+                    // 这里**不再直接 clear()**:独立验收 media-4 的 B2 证明该路径绕过
+                    // 写入门控,`ESC[2J` 会插进 mpv 在途的 sixel 载荷中间(4/4 复现)。
+                    // 改为标记待写:事件循环下一轮取安全窗口(暂停 mpv → clear+draw →
+                    // 恢复)完成重绘,同时修掉 B1 的「resize 后 chrome 永不恢复」。
                     if media.video_active {
                         let bar_h = bar_height_for(h, true);
                         media.set_area(video_area_for_with(
                             w, h, bar_h, img_ctx.cell_pixel_size()));
-                        let _ = terminal.clear();
+                        media.mark_need_write();
                     }
                     rebuild_doc(terminal, doc, &nav, &content, &mut ui, hl, skin, img_ctx, &media.input);
                 }
@@ -1531,7 +1589,7 @@ fn event_loop(
             ui.sel = None;
             if media.video_lifecycle_changed() {
                 media.sync_video_phase();
-                let _ = terminal.clear();
+                let _ = terminal.backend_mut().clear_region(ClearType::All);
             }
             rebuild_media_doc(terminal, doc, &mut ui, &nav, &content, hl, skin, img_ctx, &media);
         }
@@ -1674,7 +1732,7 @@ fn retarget_media(
             let (w, h) = current_size(terminal);
             let proto = proto_of(img_ctx);
             if media.start_video(&nav.path, w, h, proto, img_ctx.cell_pixel_size()) {
-                let _ = terminal.clear();
+                let _ = terminal.backend_mut().clear_region(ClearType::All);
             } else {
                 let reason = media.degrade_reason.clone();
                 ui.say(reason);
