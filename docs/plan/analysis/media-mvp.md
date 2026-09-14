@@ -63,3 +63,17 @@ termio(media-4) ──> media::AudioCtx      (M1/M2 会话; snapshot/dirty/控�
 | 视频区被 dlook diff 覆写 | `CellDiffOption::Skip` 标记（design §5.2），media-4 实现 + V 场景断言 |
 | 无音频设备的 CI | O 场景含降级用例；E9 探针用 null sink |
 | AC 阻塞（媒体栏/键位体量大） | media-4 拆为「布局+渲染」与「交互命中」两步提交，验收可分次 |
+
+## 集成期更新（2026-09-14）
+
+- **E14 结论已出（提交 6a12905）**：sixel **有**区域几何参数（与 kitty 同族同名），
+  故视频在 sixel 终端**不需要降级为全屏**，两种 proto 走同一条 `--vo-<vo>-left/top/cols/rows`
+  参数路径（media-4 应确认 proto 映射已传递，termio.rs:1516-1519 已正确映射）。
+- **E14 否证运行时热改**：`set_property vo-sixel-*` 返回 success 且可读回，但 raster 不变 →
+  `set_area()` 实现为**重启会话**；media-4 必须在重启前后各触发一次全量重绘
+  （design §5.4：mpv 启动/退出各发一次 `\033_Ga=d` 清屏），否则画面会消失。
+- **`--hr-seek=yes` 已加入引擎固定参数**（E14 附节）：默认 hr-seek 会把 seek 吸附到关键帧，
+  3s 素材上 `seek 25 absolute-percent` 会落到 0.0 —— click-to-seek/scrubbing 需要精确落点，
+  media-4 的 R 场景断言可据此收紧（比例 seek 应精确而非吸附）。
+- 音频 E2E 探针已修正（提交 fde1abd）：旧方法假阳性（pw-record 未绑定 monitor）。
+  media-4 若在 V 场景里做音频断言，必须采用静音基线对照。
