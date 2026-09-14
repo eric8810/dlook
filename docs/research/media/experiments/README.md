@@ -101,11 +101,39 @@ $ mpv --vo=kitty --list-options | grep vo-kitty
 
 ## E9: 音频 E2E 探针（零外放证明样本到达设备）
 
-脚本：`e9-audio-probe.sh`。原理：`pactl load-module module-null-sink` 建无声 sink →
-`pw-record` 录制其 monitor → `paplay` 播 3s 440Hz 正弦 → 分析捕获。
+脚本：`e9-audio-probe.sh`（**方法已修正，见下方说明**）。
 
-结果：捕获 161,790 帧，**RMS=5263**（静音≈0），**440Hz Goertzel 能量 8.8e11** ——
-真实音频样本确实到达输出设备，全程零外放。音频 E2E 断言方式成立。
+### ⚠ 方法学修正（2026-09-14，独立验收 F2 发现）
+
+**原记录的 RMS=5263「通过」是错的 —— 那是麦克风噪音，不是播放输出。**
+
+`pw-record --target <sink>.monitor` **不会绑定到 monitor**：monitor 不是 PipeWire
+节点，`pw-record` 静默回退到默认麦克风。实测对照（静音基线，什么都不播）：
+
+| 录制方法 | 静音基线 RMS | 判定 |
+|---|---|---|
+| `ffmpeg -f pulse -i <sink>.monitor` | **0.0** | 正确绑定 monitor |
+| `pw-record --target <sink>.monitor` | **1488.5** | 未绑定（录到麦克风噪声） |
+
+因此原探针的 `RMS>100` 断言在不播放任何音频时也会通过；且 `PULSE_SINK` 对 dlook
+无效（实测其流始终挂在默认输出 `Sink: 55`，`application.name = "PipeWire ALSA [dlook]"`，
+`media.name = "ALSA Playback"`，**不含源文件路径**），故原记录与 dlook 无因果关联。
+
+**修正后的方法（三重保证）**：
+1. 用 `ffmpeg -f pulse -i <sink>.monitor` 录制；
+2. **先录静音基线并要求 RMS < 50** —— 防假阳性的关键（录制源不对时基线非静音，
+   直接失败而非放行）；
+3. 归因：`pactl move-sink-input <dlook 流索引> <测试 sink>`，按 `application.name`
+   含 `dlook` 定位流索引。
+
+修正后实测：静音基线 RMS=0 → dlook 播放段 **RMS=4501**（通过）；反事实（换回
+`pw-record`）得到 PASS=0，不再产生假阳性。E2E 实现在
+`test/e2e/run_acceptance.py::scenario_O_e9`（提交 fde1abd）。
+
+### E12 同样需要基线对照（待补）
+
+E12 用 `ffmpeg -f pulse -i @DEFAULT_MONITOR@`（方法本身正确），但**缺少静音基线
+对照**；音频结论应补一次基线校验后再引用。
 
 ## E10: mpv IPC 第二客户端旁观（控制链端到端探针）
 
@@ -175,3 +203,99 @@ VERDICT: video=PASS, audio=PASS
 - 附带发现：PATH 中若 `~/.local/bin/dlook` 是旧版(如 0.3.0)，会被优先命中而误判
   「不支持图片」。E2E 脚本**必须用绝对路径**指向被测二进制（已在脚本中固化）。
   截图读回错误信息 `EXIT=1` + `is a binary file, skip` 即由此暴露。
+
+## E14: mpv 区域几何原型（sixel / kitty 能否限制到指定矩形）
+
+脚本：`e14-mpv-region-probe.py`（`--pty` 只跑 A 段）。素材：`test-video.mp4`（640×360@30 3s）。
+回答 media-3 的前置裁决问题：**sixel VO 有没有区域几何参数？能否实测限制到指定矩形？**
+
+```bash
+$ mpv --vo=sixel --list-options | grep -- --vo-sixel-left
+ --vo-sixel-left                  Integer (default: 0)
+$ mpv --vo=sixel --list-options | grep -cE -- '--vo-sixel-(left|top|cols|rows|width|height)'
+6
+$ mpv --vo=kitty --list-options | grep -cE -- '--vo-kitty-(left|top|cols|rows|width|height)'
+6
+```
+
+**结论 1（决定性）：sixel 有区域参数，且与 kitty 是同一族、同名同语义。**
+
+| 参数 | sixel | kitty | 语义（手册 + 实测） |
+|---|---|---|---|
+| `--vo-<vo>-left/top` | ✅ | ✅ | 画面起点，单位 = **字符格**，1 起；0 = 自动居中 |
+| `--vo-<vo>-cols/rows` | ✅ | ✅ | 可用**格**大小（0 = 读终端，退回 80×25） |
+| `--vo-<vo>-width/height` | ✅ | ✅ | 可用**像素**大小（0 = 读终端，退回 320×240） |
+| `--vo-<vo>-alt-screen` | ✅ | ✅ | 默认 yes → dlook 必须显式 `=no` |
+| `--vo-<vo>-config-clear` | ✅ | ✅ | 默认 yes → reconfig 时清屏 |
+
+**结论 2（pty 字节级，可复现）**：
+
+```
+  [A2] vo=sixel（pty 80x24 格 / 800x480 像素）
+    变体                              图像像素(WxH)   光标(row,col)
+    (无区域参数)                        (320, 180)        (3, 1)
+    left=10 top=5（仅定位）            (320, 180)       (5, 10)
+    left=3 top=2 cols=20 rows=5        (320, 180)        (2, 3)
+    left=3 top=2 width=200 height=100  (170, 96)         (2, 3)
+    left=3 top=2 width=400 height=200  (341, 192)        (2, 3)
+
+  [A3] vo=kitty（TERM=xterm-kitty）
+    变体                              分块   载荷字节    (s,v,f)       光标
+    (无区域参数)                       115   460800  (320, 180, 24)   (3, 0)
+    left=10 top=5                     115   460800  (320, 180, 24)  (5, 10)
+    left=10 top=5 width=400 height=200 141  568000  (355, 200, 24)  (5, 10)
+    left=10 top=5 width=200 height=100  37  141600  (177, 100, 24)  (5, 10)
+```
+
+- `left/top` **生效于两 vo**：sixel 的 DCS raster 原点 + 光标定位、kitty 的 `ESC[<row>;<col>H`
+  都精确等于给定的 (top,left)；像素尺寸不变（说明是「定位」不是「缩放」）。
+- `width/height` **真实裁剪输出尺寸**（不是只声明）：sixel 200×100 → raster **170×96**
+  （高度向下取 6 的倍数——sixel 单元高度，宽度按宽高比）；kitty 200×100 → `s=177,v=100`。
+- `cols/rows` **不裁剪图像像素尺寸**（声明可用格数，参与自动定位/缩放推算）。
+- 无参数时两 vo 都落到**默认像素 320×240 的等比结果 320×180**——pty 不是图形终端，
+  mpv 拿不到真实像素尺寸。
+
+**结论 3（Hyprland + foot 真实会话，sixel）**：同一 foot 窗口 before/after 对照（纯色底 →
+`mpv --pause --frames=1` 渲染一帧），diff 出画面实际占据的设备像素矩形：
+
+```
+  six-nolimit       (348, 1905, 0, 67)     ← 含光标列伪影，见下
+  six-lt1-1         (320, 180, 28, 28)
+  six-lt6-4         (320, 180, 118, 145)
+  six-lt12-9        (320, 180, 226, 340)
+  six-wh200x100     (170, 96, 28, 28)      ← 与 pty raster 逐像素一致
+  kit-in-foot       None（无变化：foot 无 kitty 协议，kitty VO 不输出画面）
+```
+
+- **left/top 在真实终端里线性生效**：列差 (118-28)/5 = (226-118)/6 = **18 设备px/格**
+  （scale 2 → 9 逻辑px/格）；行差 (145-28)/3 = (340-145)/5 = **39 设备px/行**（19.5 逻辑px/行）。
+- **width/height 生效**：请求 200×100 → 屏上画面 170×96 设备px，与 pty 段的 raster 完全一致
+  （sixel 在 foot 里 1:1 映射到设备像素）。
+- `nolimit` 行的 1905px 高是**窗口底部 shell 睡醒/滚动**造成的伪影（bare diff 会把非 mpv
+  变化一起算进去）；该行的结论只用「原点单调右/下移」这一条，尺寸以 `lt*/wh*` 变体为准。
+- 已知边界：本机多显示器混合 scale（eDP-1 scale 2 / DP-1 scale 1.6），窗口偶发被重排导致
+  截图几何漂移；脚本内做了**同窗口 before/after + 几何不一致重试**来消除该噪声。
+
+**结论 4（set_area 实现选择的依据）：运行时热改区域参数无效。**
+`set_property vo-sixel-left=10 / top=5 / width=200 / height=100` 全部返回 `success`，
+`get_property` 也读回 10/5/200（属性确实被写入），但**输出不变**：raster 恒为 320×180、
+光标恒为 (3,1)，SIGWINCH 触发 reconfig 后亦然。
+
+```
+  [1] initial (no region args)                raster=[(320,180),(320,180)] cursor=[(3,1),(3,1)]
+  [2] set left=10 (no reconfig)               raster=[(320,180)]           cursor=[(3,1)]
+  [4] left=10 top=5 w=200 h=100 + SIGWINCH    raster=[(320,180),(320,180)] cursor=[(3,1),(3,1)]
+  get left/top/width -> data 10 / 5 / 200
+```
+
+→ **区域几何必须靠「重启 mpv 会话」生效**（kill + 带新参数 respawn），media-3 的
+`set_area()` 据此实现为「记录 pending 区域 → tick 里稳定后按新几何重启会话并恢复位置/暂停/音量」。
+（对照 §5.3-5 原预案：热改是「未验证」的高风险项，此处给出否证。）
+
+**对 media-3/MPV-A 的落地结论**：sixel 与 kitty 都能做「mpv 画 body 区、dlook 画 chrome」的
+共屏形态，**sixel 不需要降级为全屏**；两者的区域参数族完全一致，`start()` 只需按 proto 换 vo 名
++ 固定 `alt-screen=no / config-clear=no / --really-quiet / --no-terminal`。
+残留不确定：像素级尺寸在**真实图形终端**里是否严格等于 `cols×rows×字体格` 取决于 mpv 能否
+拿到终端像素尺寸（pty 下拿不到、退回 320×240；foot 下 width/height 显式给出时 1:1 生效）；
+若要求像素级精确，集成层应用 picker 的字体格尺寸换算后同时传 `width/height`（接口扩展，
+交主 agent 裁决）。
