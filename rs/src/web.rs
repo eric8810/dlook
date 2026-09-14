@@ -17,10 +17,14 @@
 //!     该图在行模型里消失(dlook 无从得知 src,故不请求也不占位)。
 //!   - `_skin` 暂未参与样式:网页行样式用本文件内常量与 markdown 观感对齐。
 //!     TODO(style): 与 markdown.rs 的 LINK_LABEL_FG/LINK_URL_FG 重复,后续提取公共常量。
-//!   - 字符集:非 UTF-8 由本文件末尾内置 GB18030 表解码(**临时**方案,~73KB 生成数据;
-//!     数据取自 WHATWG gb18030 表,已逐序列对 encoding_rs 校验)。`encoding_rs` 已在
-//!     Cargo.lock(经 symphonia 间接引入,零新增下载/体积),主 agent 批准写入 Cargo.toml
-//!     后应删除 `GBK_ROWS`/`GB18030_4BYTE_RANGES` 并改用 `encoding_rs::GB18030::decode`。
+//!   - 字符集:非 UTF-8 由本文件末尾内置 GB18030 表解码(**临时**方案,~72KB 生成数据 =
+//!     71.7KB UTF-8 串 + 2.5KB 四字节区间表;数据取自 WHATWG gb18030 表,已逐序列对
+//!     encoding_rs 校验)。`encoding_rs` 已在依赖图中(merman→lol_html 与 rodio→symphonia
+//!     间接引入,`cargo tree -i encoding_rs` 可验证 → 零新增下载/编译),但**体积非零**:
+//!     实测(opt-level=z + lto=fat + strip)直接调用 `GB18030::decode` 最多 +147KiB
+//!     (经 `Encoding::for_label` 动态派发 +176KiB),与本内置表同量级。主 agent 批准写入
+//!     Cargo.toml 后应删除 `GBK_ROWS`/`GB18030_4BYTE_RANGES` 并改用
+//!     `encoding_rs::GB18030::decode`(顺带修好 Big5/Shift_JIS/EUC-KR 的乱码)。
 //!     其余字符集(Big5/Shift_JIS/KOI8-R…)当前按 UTF-8 lossy 兜底:不 panic,可能乱码。
 
 use std::io::Read;
@@ -473,10 +477,14 @@ fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
 
 /// 渲染中间结构:一个「片段」(同一样式、同一链接目标的连续文本)。
 ///
-/// 为什么不把注解直接映射为 `Span`(消融实验 A,见任务报告):
-/// 链接区坐标必须在**按 width 折行之后**的最终行集上计算——链接可能被折行截断、
-/// 追加的 ` (url)` 后缀会把行尾挤到下一行。若直接产出 Span,只能事后从渲染结果里
-/// 反解位置(markdown.rs `style_links` 的字符串扫描路线),折行边界处更脆。
+/// 为什么不把注解直接映射为 `Span`(任务要求消融实验 A,实测结论):
+/// ① 链接区坐标必须在**按 width 折行之后**的最终行集上计算:追加的 ` (url)` 后缀会把
+///    行挤宽(必须折行),而折行后 label 与后缀可能落在不同行;② 一旦只保留渲染后的
+///    文本,label 起点就无从得知——消融版(直出 Span + 按 `(url)` 后缀做字符串扫描)
+///    实测把 `a link (url)` 的链接区起点定在 `link`(丢了 `a `),
+///    `every_line_fits_width` 与 `local_html_renders_title_paragraphs_and_absolute_link`
+///    双双失败(见任务报告「消融实验」)。保留 Piece 即保留「链接来源 + 样式」,
+///    折行时按来源记账,坐标不靠反解。
 #[derive(Debug, Clone)]
 struct Piece {
     text: String,
@@ -695,76 +703,195 @@ fn remove_dot_segments(path: &str) -> String {
 // 铺行:按 width 折行 + 计算链接列(字符列,与 markdown.rs 的 LinkSpan 语义一致)
 // ---------------------------------------------------------------------------
 
+/// 一行 html2text 输出在铺行过程中的累积状态。
+#[derive(Default)]
+struct RowBuf {
+    spans: Vec<Span<'static>>,
+    /// 行内链接区(字符列);收行时落成 `LinkSpan`。
+    row_links: Vec<(usize, usize, String)>,
+    /// cell 宽度:决定折行(中文/全角占 2 列)。
+    col_cells: usize,
+    /// 字符列:决定 LinkSpan 坐标(与 markdown.rs 的 LinkSpan 语义一致:字符列)。
+    col_chars: usize,
+    /// 行内已出现、尚未落行的空白。折行时丢弃(与 html2text 自身的折行一致:
+    /// 折行处的空白是分隔符,不进行尾/列首);行末放得下则保留(表格补白/pre 缩进)。
+    pending: Option<Piece>,
+}
+
+impl RowBuf {
+    fn pending_cells(&self) -> usize {
+        self.pending
+            .as_ref()
+            .map_or(0, |p| p.text.chars().map(char_cells).sum())
+    }
+
+    /// 落一段文本(调用方保证不会超出 width;`push_text` 负责超长词的硬切)。
+    fn emit(&mut self, text: &str, style: Style, link: Option<&str>) {
+        if text.is_empty() {
+            return;
+        }
+        let start = self.col_chars;
+        self.col_cells += text.chars().map(char_cells).sum::<usize>();
+        self.col_chars += text.chars().count();
+        self.spans.push(Span::styled(text.to_string(), style));
+        if let Some(target) = link {
+            match self.row_links.last_mut() {
+                Some((_, end, prev)) if prev == target && *end == start => *end = self.col_chars,
+                _ => {
+                    self.row_links
+                        .push((start, self.col_chars, target.to_string()))
+                }
+            }
+        }
+    }
+
+    /// 落一段可能超宽文本(超长「词」/行首缩进):按 cell 硬切,保证每行 ≤ width。
+    fn push_text(
+        &mut self,
+        text: &str,
+        style: Style,
+        link: Option<&str>,
+        width: usize,
+        lines: &mut Vec<Line<'static>>,
+        all_links: &mut Vec<LinkSpan>,
+    ) {
+        let mut rest: &str = text;
+        while !rest.is_empty() {
+            if self.col_cells >= width {
+                self.flush(lines, all_links, width);
+            }
+            // 宽字符边界:整字放不下就收行(行内已有内容,不会死循环);
+            // 行内为空时仍取该字符,保证推进(width 小于单字宽度的退化情形)。
+            let first = rest.chars().next().map_or(0, char_cells);
+            if self.col_cells > 0 && self.col_cells + first > width {
+                self.flush(lines, all_links, width);
+                continue;
+            }
+            let (chunk, tail) = split_cells(rest, width - self.col_cells);
+            if chunk.is_empty() {
+                break; // 兜底:不应发生(split_cells 至少取 1 字符)
+            }
+            self.emit(chunk, style, link);
+            rest = tail;
+        }
+    }
+
+    /// 收行:行号 = 当前 lines 长度(LinkSpan.line 语义与 markdown 一致:最终行集索引)。
+    /// 行末的待落空白:放得下才保留(避免任何情况下超出 width)。
+    fn flush(
+        &mut self,
+        lines: &mut Vec<Line<'static>>,
+        all_links: &mut Vec<LinkSpan>,
+        width: usize,
+    ) {
+        if let Some(ws) = self.pending.take() {
+            if self.col_cells + cells_of(&ws.text) <= width {
+                self.emit(&ws.text, ws.style, ws.link.as_deref());
+            }
+        }
+        let line = lines.len();
+        for (start, end, target) in self.row_links.drain(..) {
+            if end > start {
+                all_links.push(LinkSpan {
+                    line,
+                    start,
+                    end,
+                    target,
+                });
+            }
+        }
+        lines.push(Line::default().spans(std::mem::take(&mut self.spans)));
+        self.col_cells = 0;
+        self.col_chars = 0;
+    }
+
+    /// 折行:同 `flush`,但待落空白随折行丢弃(折行处空白 = 分隔符)。
+    fn wrap(
+        &mut self,
+        width: usize,
+        lines: &mut Vec<Line<'static>>,
+        all_links: &mut Vec<LinkSpan>,
+    ) {
+        self.pending = None;
+        self.flush(lines, all_links, width);
+    }
+}
+
 /// 把一个 html2text 输出行(片段序列)铺成若干 doc 行 + 链接区。
+///
+/// 折行以**整词**为单位(与 html2text 自身的折行策略一致):只有单个「词」
+/// (无空白的连续文本,如超长 URL、CJK 段落)本身超过 width 时才按 cell 硬切。
+/// 这样追加的 ` (url)` 后缀把行挤宽时,不会把 `here.` 切成 `he`+`re.`。
 /// 每个 html2text 行独立处理:保留段落/块级结构,只在超宽时继续折行。
 fn layout(rows: Vec<Vec<Piece>>, width: usize) -> (Vec<Line<'static>>, Vec<LinkSpan>) {
     let width = width.max(1);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut all_links: Vec<LinkSpan> = Vec::new();
     for pieces in rows {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut row_links: Vec<(usize, usize, String)> = Vec::new();
-        // 两个计数器:cell 宽度决定折行(中文/全角占 2 列),
-        // 字符列决定 LinkSpan 坐标(与 markdown.rs 的 LinkSpan 语义一致:字符列)。
-        let mut col_cells = 0usize;
-        let mut col_chars = 0usize;
+        let mut rb = RowBuf::default();
         for p in pieces {
+            let style = p.style;
+            let link = p.link.as_deref();
             let mut rest: &str = &p.text;
             while !rest.is_empty() {
-                if col_cells >= width {
-                    flush_row(&mut lines, &mut all_links, &mut spans, &mut row_links);
-                    col_cells = 0;
-                    col_chars = 0;
-                }
-                // 宽字符边界:整字放不下就收行(行内已有内容,不会死循环);
-                // 行内为空时仍取该字符,保证推进(width 小于单字宽度的退化情形)。
-                let first = rest.chars().next().map_or(0, char_cells);
-                if col_cells > 0 && col_cells + first > width {
-                    flush_row(&mut lines, &mut all_links, &mut spans, &mut row_links);
-                    col_cells = 0;
-                    col_chars = 0;
-                }
-                let (chunk, tail) = split_cells(rest, width - col_cells);
-                if chunk.is_empty() {
-                    break; // 兜底:不应发生(split_cells 至少取 1 字符)
-                }
-                let start = col_chars;
-                col_cells += chunk.chars().map(char_cells).sum::<usize>();
-                col_chars += chunk.chars().count();
-                spans.push(Span::styled(chunk.to_string(), p.style));
-                if let Some(target) = &p.link {
-                    match row_links.last_mut() {
-                        Some((_, end, t0)) if t0 == target && *end == start => *end = col_chars,
-                        _ => row_links.push((start, col_chars, target.clone())),
-                    }
-                }
+                let (atom, tail) = split_atom(rest);
                 rest = tail;
+                if atom.starts_with(is_break_space) {
+                    if rb.col_cells == 0 {
+                        // 行首空白(缩进/表格补白):照原样落行
+                        rb.push_text(atom, style, link, width, &mut lines, &mut all_links);
+                    } else {
+                        match rb.pending.as_mut() {
+                            Some(prev) => prev.text.push_str(atom),
+                            None => {
+                                rb.pending = Some(Piece {
+                                    text: atom.to_string(),
+                                    style,
+                                    link: p.link.clone(),
+                                })
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // 整词:先看「待落空白 + 词」能否整体放下,放不下则提前收行。
+                let word_cells = cells_of(atom);
+                if rb.col_cells > 0 && rb.col_cells + rb.pending_cells() + word_cells > width {
+                    rb.wrap(width, &mut lines, &mut all_links);
+                }
+                if let Some(ws) = rb.pending.take() {
+                    rb.emit(&ws.text, ws.style, ws.link.as_deref());
+                }
+                rb.push_text(atom, style, link, width, &mut lines, &mut all_links);
             }
         }
-        flush_row(&mut lines, &mut all_links, &mut spans, &mut row_links);
+        rb.flush(&mut lines, &mut all_links, width);
     }
     (lines, all_links)
 }
 
-/// 收行:行号 = 当前 lines 长度(LinkSpan.line 语义与 markdown 一致:最终行集索引)。
-fn flush_row(
-    lines: &mut Vec<Line<'static>>,
-    all_links: &mut Vec<LinkSpan>,
-    spans: &mut Vec<Span<'static>>,
-    row_links: &mut Vec<(usize, usize, String)>,
-) {
-    let line = lines.len();
-    for (start, end, target) in row_links.drain(..) {
-        if end > start {
-            all_links.push(LinkSpan {
-                line,
-                start,
-                end,
-                target,
-            });
+/// 取行首「原子」:一段空白或一个词(无空白的连续文本)。
+/// 折行以词为单位,故词内部不做断点(超长词由 `push_text` 兜底硬切)。
+fn split_atom(s: &str) -> (&str, &str) {
+    let ws = s.starts_with(is_break_space);
+    let mut end = s.len();
+    for (i, ch) in s.char_indices() {
+        if is_break_space(ch) != ws {
+            end = i;
+            break;
         }
     }
-    lines.push(Line::default().spans(std::mem::take(spans)));
+    s.split_at(end)
+}
+
+/// 可作折行断点的空白。U+00A0(NBSP,`&nbsp;`)按语义**不可**断行,故不算断点。
+fn is_break_space(c: char) -> bool {
+    c.is_whitespace() && c != '\u{a0}'
+}
+
+/// 字符串的 cell 宽度(中文/全角/emoji 占 2 列)。
+fn cells_of(s: &str) -> usize {
+    s.chars().map(char_cells).sum()
 }
 
 /// 取不超过 `room` cell 宽度的前缀(至少 1 个字符,避免零宽字符造成死循环)。
@@ -905,9 +1032,11 @@ fn gb18030_4byte_lookup(p: u32) -> Option<char> {
 
 /// GBK/GB18030 双字节平面(lead 0x81–0xFE × trail 190 个),按 `lead - 0x81` 索引。
 ///
-/// 每行 190 个字符,`~` 表示该码位未分配(解码为 U+FFFD)。
-/// 数据由 encoding_rs(WHATWG gb18030 表)生成;见文件头 TODO——临时自实现,
-/// 主 agent 批准 `encoding_rs` 依赖后应整体删除本表。
+/// 每行 190 个字符(trail 0x40–0x7E + 0x80–0xFE)。GB18030 为该平面全部 23,940 个码位
+/// 都定义了映射(规范里 GBK 未分配的码位落到 PUA),故现表没有 `~` 占位;`~` 仍按
+/// 「未分配 → U+FFFD」处理,以防后续改表。生成数据已逐序列对 encoding_rs 0.8 校验:
+/// 23,940 个双字节序列 + 1,087,996 个四字节指针,0 差异(见 `gb18030_table_shape_is_intact`)。
+/// 见文件头 TODO:主 agent 批准 `encoding_rs` 依赖后应整体删除本表。
 #[rustfmt::skip]
 const GBK_ROWS: [&str; 126] = [
     "丂丄丅丆丏丒丗丟丠両丣並丩丮丯丱丳丵丷丼乀乁乂乄乆乊乑乕乗乚乛乢乣乤乥乧乨乪乫乬乭乮乯乲乴乵乶乷乸乹乺乻乼乽乿亀亁亂亃亄亅亇亊亐亖亗亙亜亝亞亣亪亯亰亱亴亶亷亸亹亼亽亾仈仌仏仐仒仚仛仜仠仢仦仧仩仭仮仯仱仴仸仹仺仼仾伀伂伃伄伅伆伇伈伋伌伒伓伔伕伖伜伝伡伣伨伩伬伭伮伱伳伵伷伹伻伾伿佀佁佂佄佅佇佈佉佊佋佌佒佔佖佡佢佦佨佪佫佭佮佱佲併佷佸佹佺佽侀侁侂侅來侇侊侌侎侐侒侓侕侖侘侙侚侜侞侟価侢",
@@ -1244,6 +1373,38 @@ mod tests {
         assert!(all_text(&doc).contains("here."), "{row}");
     }
 
+    /// 折行只发生在空白处(整词折行),不把词切开:
+    /// width=80 时追加的 ` (url)` 后缀把该段挤宽,折行必须落在 `here.` 之前,
+    /// 而不是把 `here.` 切成 `he`+`re.`(html2text 自身折行同样不切词)。
+    #[test]
+    fn overflow_wrap_breaks_at_word_boundary() {
+        let dir = temp_dir("wrap");
+        let html = r#"<html><head><title>w</title></head><body>
+<p>First paragraph with <a href="sub/next.html">a link</a> here.</p>
+</body></html>"#;
+        let path = write_file(&dir, "w.html", html.as_bytes());
+        let doc = view(render(path.to_str().unwrap(), 80, &skin()));
+
+        let rows: Vec<String> = doc
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .filter(|r| !r.trim().is_empty())
+            .collect();
+        let dir_url = &doc.final_url[..doc.final_url.rfind('/').unwrap()];
+        // 每处折行都丢掉一个分隔空白,故「行去掉首尾空白后用单个空格重接」= 原文本
+        // (若某个词被硬切,重接后会在词中间多出空格,断言即失败)。
+        let rejoined = rows.iter().map(|r| r.trim()).collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            rejoined,
+            format!("First paragraph with a link ({dir_url}/sub/next.html) here."),
+            "{rows:?}"
+        );
+        for row in &rows {
+            assert!(row.chars().count() <= 80, "{row:?}");
+        }
+    }
+
     /// 相对链接里的 `..`/`.` 与 base 目录语义(纯函数级)。
     #[test]
     fn resolve_url_joins_relative_targets() {
@@ -1381,6 +1542,30 @@ fn main() {
         // 非法序列:U+FFFD,且后续 ASCII 不丢
         assert_eq!(decode_gb18030(&[0x81, 0x30]), "\u{FFFD}0");
         assert_eq!(decode_gb18030(b"a\xFFb"), "a\u{FFFD}b");
+    }
+
+    /// 表结构不变量(采样测试抓不到的静默错位):
+    /// 双字节平面恰好 126×190、映射数固定;四字节区间严格递增互不重叠(二分查找前提)。
+    /// 生成数据被改坏(某行少一个字符 → 该行之后整体错位)时此测试立即失败。
+    #[test]
+    fn gb18030_table_shape_is_intact() {
+        assert_eq!(GBK_ROWS.len(), 126);
+        for (i, row) in GBK_ROWS.iter().enumerate() {
+            assert_eq!(row.chars().count(), 190, "GBK_ROWS[{i}] 行宽异常");
+        }
+        let assigned: usize = GBK_ROWS
+            .iter()
+            .map(|r| r.chars().filter(|c| *c != '~').count())
+            .sum();
+        // 现表 23,940 个双字节码位全部有映射(GB18030 把规范里的「未分配」码位也映射到
+        // PUA,故没有 `~` 占位)。数字变化 = 表被改动,须重新逐序列对 encoding_rs 校验。
+        assert_eq!(assigned, 23_940, "双字节平面映射数变化");
+        assert_eq!(GB18030_4BYTE_RANGES.len(), 209);
+        let mut end = 0u32;
+        for (i, (start, _code, len)) in GB18030_4BYTE_RANGES.iter().enumerate() {
+            assert!(*start >= end, "4 字节区间 [{i}] 与前驱重叠");
+            end = *start + *len;
+        }
     }
 
     // ---- 5. 超限 / 空 / 连接拒绝 ----
