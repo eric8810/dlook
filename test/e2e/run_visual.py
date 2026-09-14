@@ -193,11 +193,54 @@ def window_count():
                (c.get("title", "") + c.get("class", "")))
 
 
+def active_window_ident():
+    """当前活动窗口的**唯一地址**（Hyprland address）——用于注入后还原焦点。
+
+    必须用 address：按 class 匹配会命中同类窗口中的任意一个（本机有多个 foot 窗口，
+    实测按 class 还原会切到别的 foot）。返回 None 表示取不到。
+    """
+    try:
+        c = json.loads(sh(["hyprctl", "activewindow", "-j"]).stdout)
+        return c.get("address") or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def focus(tag):
+    """聚焦测试窗口以注入按键，返回「之前的活动窗口」供调用方恢复。
+
+    wtype 只能把按键送给**当前聚焦**的 Wayland 表面，因此注入前必须聚焦测试窗口；
+    若注入后不还原，用户的焦点会被反复抢走。调用方应在注入完成后调用
+    `restore_focus(prev)` 把焦点还给用户原来的窗口。
+    """
+    prev = active_window_ident()
     r = sh(["hyprctl", "dispatch", f'hl.dsp.focus({{window="class:{tag}"}})'])
     if r.returncode != 0 or "ok" not in (r.stdout + r.stderr).lower():
         sh(["hyprctl", "dispatch", "focuswindow", f"class:{tag}"])
     time.sleep(0.4)
+    return prev
+
+
+def is_test_window(address):
+    """该地址是否属于本次 V 套件的测试窗口（是则不必还原焦点）。"""
+    if not address:
+        return False
+    for c in hypr_clients():
+        if c.get("address") == address:
+            blob = c.get("title", "") + c.get("class", "")
+            return TAG_PREFIX in blob
+    return False
+
+
+def restore_focus(prev):
+    """把焦点还给 `focus()` 之前的窗口（按 address 精确定位，用户自己的窗口）。
+
+    连续注入时若上一个窗口本就是测试窗口，则不必来回切。失败静默——焦点还原不该
+    让测试挂掉。
+    """
+    if not prev or is_test_window(prev):
+        return
+    sh(["hyprctl", "dispatch", f'hl.dsp.focus({{window="address:{prev}"}})'])
 
 
 def key(*keys):
@@ -574,9 +617,15 @@ class Session:
                   f"{self.geo['size'][1]} @ {tuple(self.geo['at'])}")
 
     def _raise(self):
-        """截图前把测试窗口置顶：否则并行的其他窗口会盖在我们的截图上（OCR 串味）。"""
+        """截图前把测试窗口置顶，返回之前的活动窗口（截图后还原焦点）。
+
+        置顶是必要的（否则并行的其他浮动窗口会盖在被截区域上，OCR 串味）；但不需要
+        持续聚焦——故 `_grab` 在 grim 完成后立刻把焦点还给用户。
+        """
+        prev = active_window_ident()
         sh(["hyprctl", "dispatch", f'hl.dsp.focus({{window="class:{self.tag}"}})'])
         time.sleep(0.25)
+        return prev
 
     def rc(self):
         if os.path.exists(self.rc_path):
@@ -589,14 +638,16 @@ class Session:
     # ---- 截图 / 按键 ----
     def _grab(self, name, tag_suffix=""):
         """单次截图（窗口当前几何）；返回 (path, size) 或 (None, None)。"""
-        self._raise()
+        prev = self._raise()
         c = find_window(self.tag)
         if not c:
+            restore_focus(prev)
             return None, None
         x, y = c["at"]
         w, h = c["size"]
         path = os.path.join(self.dir, f"{name}{tag_suffix}.png")
         sh(["grim", "-g", f"{x},{y} {w}x{h}", path])
+        restore_focus(prev)  # 截图完成 → 焦点还给用户
         DIMS.pop(path, None)
         _CACHE.pop(path, None)
         return path, png_size(path)
@@ -651,8 +702,13 @@ class Session:
         return a if a.ok else None
 
     def send(self, *keys):
-        focus(self.tag)
-        return key(*keys)
+        # 注入按键需要聚焦测试窗口；注入后立刻把焦点还给用户原来的窗口
+        # （否则连续注入会把用户的焦点一直抢在测试窗口上）。
+        prev = focus(self.tag)
+        try:
+            return key(*keys)
+        finally:
+            restore_focus(prev)
 
     def quit(self, timeout=8.0):
         """注入 q，返回退出码或 None（注入失败则 SIGTERM 兜底）。"""
@@ -1046,6 +1102,69 @@ def v3_coscreen(s):
     # 素材可能已播完、mpv 已退出，断言会假失败）。
 
 
+def v3b_live_refresh(s):
+    """V3b 播放期反馈与 resize 恢复（独立验收 media-4 的 B1/B2 回归）。
+
+    这两条是真实缺陷的回归测试：早先的实现「mpv 活跃期间一律不写终端」虽然消除了
+    撕裂，却让媒体栏时间码冻结、按键反馈消失、resize 后 chrome 永不恢复。现有断言
+    （chrome 行「播放期稳定」）在该方案下是平凡通过，覆盖不到本问题。
+    """
+    print("== V3b 播放期媒体栏刷新 / 按键反馈 / resize 恢复 ==")
+
+    # 统一用 s.shot()（它自己做尺寸稳定性检查并登记到 self.shots，anchor_for 依赖该登记）
+    fresh = s.shot
+
+    t0 = time.time() + 15
+    base = None
+    while time.time() < t0:
+        base = fresh("live-base")
+        if base:
+            an = s.anchor_for("live-base")
+            if an is not None and region_stats(base, *an.bands(bar_h=2)["body"])["quant"] >= 50:
+                break
+        time.sleep(0.6)
+    if base is None or s.anchor_for("live-base") is None:
+        skip("V3b 播放期媒体栏刷新", "视频未上屏/自标定失败")
+        skip("V3b 按键反馈", "同上")
+        skip("V3b resize 恢复 chrome", "同上")
+        return
+
+    # a) 媒体栏必须随播放推进（时间码/进度条像素变化），否则时间码是冻结的
+    an = s.anchor_for("live-base")
+    bd = an.bands(bar_h=2)
+    d, n, _ = diff_over_pairs(s, "live-base", "live-a", bd["bar"], gap=1.6, want="max")
+    check(nonzero(d) and d > 0.0005,
+          "V3b 媒体栏随播放刷新（时间码/进度条变化）",
+          f"bar diff={d}（{n} 次采样取最大；0 = 时间码冻结）")
+
+    # b) 播放中按 → 必须有可见反馈（状态栏消息）
+    s.send("Right")
+    time.sleep(0.6)
+    seek_shot = fresh("live-seek")
+    txt = ocr(seek_shot) if seek_shot else ""
+    check("seek" in txt.lower(), "V3b 播放中 seek 有可见反馈", txt.strip()[-60:])
+
+    # c) resize 后 chrome 必须恢复，且无旧内容残留
+    subprocess.run(["hyprctl", "dispatch",
+                    f'hl.dsp.window.resize({{window="class:{s.tag}", x=1000, y=700}})'],
+                   capture_output=True)
+    time.sleep(3.0)
+    rz = fresh("live-resize")
+    if rz is None:
+        skip("V3b resize 恢复 chrome", "resize 后截图失败")
+        return
+    rtxt = ocr(rz)
+    check("mp4" in rtxt or "test-60s" in rtxt,
+          "V3b resize 后 header 恢复（文件名可见）", rtxt.strip().splitlines()[0][:50])
+    check("space" in rtxt.lower() or "quit" in rtxt.lower(),
+          "V3b resize 后 footer 恢复（键位表可见）", rtxt.strip()[-50:])
+    frag = re.findall(r"\b\d{2,4}~\b", rtxt)
+    check(not frag, "V3b resize 后无旧内容残留碎片", f"fragments={frag[:5]}")
+    # 视频区不应被 chrome 文字覆写（撕裂回归）
+    chrome = re.findall(r"(?i)\b(quit|mute|scroll)\b", rtxt)
+    check(len(chrome) <= 4, "V3b resize 后视频区无 chrome 覆写", f"tokens={chrome[:5]}")
+
+
 def v4_residue(session_rc, tag):
     print("== V4 退出回收（无残留 mpv / 窗口）==")
     check(session_rc == 0, f"V4 视频会话 q 退出码 0 (got {session_rc})")
@@ -1147,6 +1266,28 @@ def final_cleanup():
           str([c[:60] for c in cmds[:2]]))
 
 
+def install_signal_cleanup():
+    """被 SIGTERM/SIGINT 打断时也要清理测试窗口/进程。
+
+    背景：测试脚本被外部打断（timeout、Ctrl-C、用户取消）时，默认信号处理会直接
+    终止进程，`finally` 不执行，于是测试窗口与 mpv 进程留在桌面上（实测发生过）。
+    """
+    def handler(signum, _frame):
+        print(f"\n(interrupt) 收到信号 {signum}，清理测试进程与窗口")
+        try:
+            for s in list(SESSIONS):
+                s.close()
+            sweep(kill=True)
+        finally:
+            os._exit(130)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            pass
+
+
 def preflight():
     problems = [t for t in ("hyprctl", "grim", "foot", "wtype", "magick", "tesseract")
                 if not shutil.which(t)]
@@ -1173,6 +1314,7 @@ def preflight():
 
 
 def main():
+    install_signal_cleanup()
     if not preflight():
         print()
         print(f"RESULT: PASS={PASS} FAIL={FAIL} SKIP={SKIP}")
@@ -1187,6 +1329,7 @@ def main():
         else:
             v2_video(sess)
             v3_coscreen(sess)
+            v3b_live_refresh(sess)
             rc = sess.quit()
             tag = sess.tag
             sess.close()
