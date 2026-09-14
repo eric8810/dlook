@@ -1337,8 +1337,12 @@ fn event_loop(
             let proto = proto_of(img_ctx);
             media.start_video(&nav.path, w, h, proto, img_ctx.cell_pixel_size());
             if media.video_active {
-                // mpv 启动会清空终端图像(研究 §已知坑:\033_Ga=d)→ 全量重绘
-                let _ = terminal.backend_mut().clear_region(ClearType::All);
+                // mpv 启动会清空终端图像(研究 §已知坑:\033_Ga=d)→ 全量重绘。
+                // 经门写入：此刻转发器可能已在收 mpv 的早期输出。
+                if media.video.begin_write() {
+                    let _ = terminal.backend_mut().clear_region(ClearType::All);
+                    media.video.end_write();
+                }
             } else {
                 let reason = media.degrade_reason.clone();
                 ui.say(reason);
@@ -1368,45 +1372,32 @@ fn event_loop(
         // **mpv 暂停时不输出任何字节**（pause=true 后 0.5s 窗口输出从 ~260KB 降到 0），
         // 所以「需要写时先暂停 mpv → 写 → 恢复播放」既无撕裂也不丢反馈。
         // 正常播放的 tick 不触发写入（不会每秒反复暂停导致卡顿）。
-        // 注意「相位 != 播放」**不等于**可以写：mpv 重启（resize → set_area）期间新进程
-        // 已经在画帧，此时写入同样会撕裂（独立验收 media-4 的 B2）。唯一可靠的判据是
-        // VideoCtx::begin_write()——它只在确认 mpv 不输出时返回 Safe。
+        // 终端写入窗口（视频共屏的关键不变量）：mpv 的像素输出经管道由**转发线程**
+        // 写入终端，转发器在 sixel 载荷中间持门；这里取门，保证 dlook 的 chrome 只写在
+        // 载荷边界上。任何时刻只有一个写入者、且不在载荷内部 —— 这是「不撕裂」的保证。
+        //
+        // 门等待超时（150ms）时返回 false：跳过本次绘制，下一轮再试（不冒撕裂风险）。
+        // 视频未激活时 gate 不存在，begin_write 直接成功。
         let phase_changed = media.video_phase() != media.video_phase_now();
-        // 需要写的情形：非视频会话 / 相位变化（mpv 启动或退出发 \033_Ga=d 清屏）/
-        // 集成层标记了待写（用户操作、resize、会话事件）。正常播放的 tick 不置位，
-        // 因此不会每 200ms 反复暂停（不会影响播放流畅度）。
         let want_write = !media.video_active || phase_changed || media.peek_need_write();
-        if want_write {
-            let window = if media.video_active {
-                media.video.begin_write()
-            } else {
-                WriteWindow::Safe { resume: false }
-            };
-            match window {
-                WriteWindow::Safe { resume } => {
-                    if phase_changed {
-                        media.sync_video_phase();
-                        let _ = terminal.backend_mut().clear_region(ClearType::All);
-                    }
-                    let view = media.view();
-                    let _ = terminal.draw(|f| {
-                        render_frame(
-                            f,
-                            doc,
-                            &nav.path,
-                            &mut ui,
-                            &view,
-                            !nav.history.is_empty(),
-                        )
-                    });
-                    if media.video_active {
-                        media.video.end_write(resume);
-                    }
-                    media.clear_need_write();
-                }
-                // mpv 正在输出且无法暂停：保留待写标记，下一轮再试（不冒撕裂风险）
-                WriteWindow::Busy => {}
+        if want_write && media.video.begin_write() {
+            if phase_changed {
+                media.sync_video_phase();
+                let _ = terminal.backend_mut().clear_region(ClearType::All);
             }
+            let view = media.view();
+            let _ = terminal.draw(|f| {
+                render_frame(
+                    f,
+                    doc,
+                    &nav.path,
+                    &mut ui,
+                    &view,
+                    !nav.history.is_empty(),
+                )
+            });
+            media.video.end_write();
+            media.clear_need_write();
         }
 
         // 用 poll 非阻塞检查终端事件(200ms 超时兼作热重载轮询周期)
@@ -1564,7 +1555,7 @@ fn event_loop(
                         let bar_h = bar_height_for(h, true);
                         media.set_area(video_area_for_with(
                             w, h, bar_h, img_ctx.cell_pixel_size()));
-                        media.mark_need_write();
+                        media.mark_need_write();  // 实际 clear+draw 由门控路径执行
                     }
                     rebuild_doc(terminal, doc, &nav, &content, &mut ui, hl, skin, img_ctx, &media.input);
                 }
@@ -1732,7 +1723,10 @@ fn retarget_media(
             let (w, h) = current_size(terminal);
             let proto = proto_of(img_ctx);
             if media.start_video(&nav.path, w, h, proto, img_ctx.cell_pixel_size()) {
-                let _ = terminal.backend_mut().clear_region(ClearType::All);
+                if media.video.begin_write() {
+                    let _ = terminal.backend_mut().clear_region(ClearType::All);
+                    media.video.end_write();
+                }
             } else {
                 let reason = media.degrade_reason.clone();
                 ui.say(reason);

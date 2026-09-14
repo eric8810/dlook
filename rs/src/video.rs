@@ -40,7 +40,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 /// 等待 mpv 创建 IPC socket 的上限(task 要求 ≤5s)。
@@ -57,6 +57,20 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const AREA_SETTLE: Duration = Duration::from_millis(250);
 /// 连续多少次 IPC 失败判定会话失联(200ms tick × 5 ≈ 1s)。
 const MAX_IPC_FAILURES: u32 = 5;
+/// 终端写入门的等待上限:超时则本次不写(下一轮重试),避免拖住 UI 事件循环。
+const GATE_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// 终端写入门 + 载荷边界状态（见 `VideoCtx::acquire_tty`）。
+///
+/// `held` = 当前有写入者（可能是转发器正在写一条 sixel 载荷，也可能是 dlook 正在
+/// 写 chrome）。转发器在载荷开始前 acquire、载荷结束后 release，因此 dlook 的
+/// chrome 永远落在载荷边界上。
+#[derive(Default)]
+struct Gate {
+    held: Mutex<bool>,
+    cv: Condvar,
+}
+
 /// 默认逻辑音量(与 AudioCtx 的 DEFAULT_VOLUME 一致;首次 start 前即可调整)。
 const DEFAULT_VOLUME: f32 = 0.8;
 
@@ -94,6 +108,86 @@ pub enum VideoStatus {
     /// 播放自然结束(mpv 仍在,可重播;或已退出)。
     Finished,
     Failed(String),
+}
+
+
+/// dlook 唯一写入者的前提：把 mpv 的像素输出经管道转发到终端。
+///
+/// 返回值 = (写入门, 转发线程句柄)。线程做的事：
+///   1. 从 mpv stdout 读字节
+///   2. 写终端前 acquire 门，并跟踪 sixel 载荷边界（ESC P..ESC \）；**载荷中间不放门**
+///   3. EOF 时若停在载荷中间，补一个终止符，避免终端停在 DCS 状态吞掉后续 chrome
+///
+/// 于是 dlook 的 chrome 写入（acquire_tty）只会落在载荷边界，任何时刻都只有一个
+/// 写入者、且不在载荷内部 —— 这取代了「暂停 mpv 再写」的不安全做法。
+fn spawn_forwarder(
+    mut from_mpv: impl Read + Send + 'static,
+    gate: Arc<Gate>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("dlook-mpv-fwd".into())
+        .spawn(move || {
+            let mut out = std::io::stdout();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut inside = false;
+            loop {
+                let n = match from_mpv.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                if !inside {
+                    // 载荷（或普通字节）开始前取门：保证 dlook 不会插进来
+                    let mut held = gate.held.lock().unwrap_or_else(PoisonError::into_inner);
+                    while *held {
+                        held = gate.cv.wait(held).unwrap_or_else(PoisonError::into_inner);
+                    }
+                    *held = true;
+                }
+                let _ = out.write_all(&buf[..n]);
+                let _ = out.flush();
+                inside = scan_inside_payload(&buf[..n], inside);
+                if !inside {
+                    let mut held = gate.held.lock().unwrap_or_else(PoisonError::into_inner);
+                    *held = false;
+                    gate.cv.notify_all();
+                }
+            }
+            if inside {
+                // 截断的载荷：补终止符，别让终端停在 DCS 状态
+                let _ = out.write_all(b"\x1b\\");
+                let _ = out.flush();
+            }
+            let mut held = gate.held.lock().unwrap_or_else(PoisonError::into_inner);
+            *held = false;
+            gate.cv.notify_all();
+        })
+        .unwrap_or_else(|_| {
+            // 线程起不来：返回一个空句柄（门保持空闲，退化为"直接写"）
+            std::thread::spawn(|| {})
+        })
+}
+
+/// 跟踪 sixel DCS 状态：返回处理完 `chunk` 后是否仍在载荷内部。
+/// 载荷 = `ESC P` 开始、`ESC \`（ST）结束；载荷内部不再嵌套 DCS。
+fn scan_inside_payload(chunk: &[u8], mut inside: bool) -> bool {
+    let mut i = 0;
+    while i < chunk.len() {
+        if !inside {
+            if chunk[i] == 0x1b && chunk.get(i + 1) == Some(&b'P') {
+                inside = true;
+                i += 2;
+                continue;
+            }
+        } else if chunk[i] == 0x1b && chunk.get(i + 1) == Some(&b'\\') {
+            inside = false;
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    inside
 }
 
 /// 终端写入安全窗口（见 `VideoCtx::begin_write`）。
@@ -444,6 +538,8 @@ struct Session {
     volume_before_mute: f32,
     /// 连续 IPC 失败计数(失联判定)。
     ipc_failures: u32,
+    /// 终端写入门;None = 未启用转发(测试用 Stdio::null(),终端无 mpv 输出)。
+    gate: Option<Arc<Gate>>,
     /// set_area 记下的待生效区域(几何稳定后由 tick 重启会话)。
     pending_area: Option<VideoArea>,
     pending_since: Option<Instant>,
@@ -558,7 +654,7 @@ impl VideoCtx {
     /// 启动播放(后台 spawn + 等待 IPC 就绪;期间 snapshot().status == Loading)。
     /// `src` 为本地路径;`proto` 为 None 时返回错误(集成层改走降级链)。
     pub fn start(&self, src: &str, area: VideoArea, proto: TermProto) -> Result<(), String> {
-        self.start_with(src, area, proto, &[], Stdio::inherit())
+        self.start_with(src, area, proto, &[], None)
     }
 
     /// 停止(发 quit,等待子进程回收,清理 socket);幂等。
@@ -615,76 +711,6 @@ impl VideoCtx {
 
     /// 显式暂停（幂等）。供集成层取「安全写入窗口」：mpv 暂停时**不再输出**
     /// sixel/kitty 载荷（实测：pause=true 后 0.5s 窗口内输出字节从 ~260KB 降到 0），
-    /// 此刻 dlook 写自己的 chrome 不会插进 mpv 的转义流中间。
-    ///
-    /// 返回 true 表示「本次调用真的让它从播放变为暂停」（调用方据此决定是否恢复）。
-    /// 取「写入安全窗口」：只有本方法返回 `Safe` 时，调用方才可以写终端。
-    ///
-    /// 不变量：**dlook 只在 mpv 不输出字节时写入**。实测依据：
-    /// - mpv 播放时每 0.5s 输出 ~260KB sixel 载荷（帧流几乎无间隙）；
-    /// - `set_property pause true` 后输出立即归零（0.5s 窗口内 0 字节），恢复后立刻回升。
-    ///
-    /// 因此安全窗口 = 无会话 / mpv 已退出 / mpv 已暂停 / **本次成功暂停了 mpv**
-    /// （返回 `Safe { resume: true }`，调用方写完后须调 `end_write`）。
-    ///
-    /// `Busy` 表示 mpv 正在输出且此刻无法暂停（IPC 未就绪、失联等）——此时**必须放弃
-    /// 本次写入**；否则字节会插进在途的转义序列中间，终端把残余载荷当文本打印
-    /// （V 套件与独立验收 media-4 的 B2 均实测到该撕裂）。
-    pub fn begin_write(&self) -> WriteWindow {
-        let mut inner = self.shared.lock();
-        let session = match &mut inner.state {
-            State::Idle | State::Failed(_) => return WriteWindow::Safe { resume: false },
-            State::Live(session) => session,
-        };
-        if session.child.is_none() {
-            // mpv 已退出（退出时已发 `\033_Ga=d` 清图）：它不再输出，写入安全
-            return WriteWindow::Safe { resume: false };
-        }
-        if session.paused {
-            return WriteWindow::Safe { resume: false };
-        }
-        let Some(ipc) = session.ipc.as_mut() else {
-            return WriteWindow::Busy; // 子进程在跑但 IPC 未就绪 → 可能正在输出
-        };
-        if ipc.set_property("pause", Json::Bool(true)).is_ok() {
-            session.paused = true;
-            session.status = VideoStatus::Paused;
-            let _ = refresh_playback(session);
-            drop(inner);
-            self.shared.bump_dirty();
-            return WriteWindow::Safe { resume: true };
-        }
-        WriteWindow::Busy
-    }
-
-    /// 结束写入安全窗口；`resume` 为 `begin_write` 给出的值，true 时恢复播放。
-    pub fn end_write(&self, resume: bool) {
-        if resume {
-            self.play();
-        }
-    }
-
-    /// 显式恢复播放（幂等）。与 `pause` 配对使用，见其文档。
-    pub fn play(&self) {
-        let mut inner = self.shared.lock();
-        let State::Live(session) = &mut inner.state else {
-            return;
-        };
-        if session.child.is_none() || !session.paused {
-            return;
-        }
-        let Some(ipc) = session.ipc.as_mut() else {
-            return;
-        };
-        if ipc.set_property("pause", Json::Bool(false)).is_ok() {
-            session.paused = false;
-            session.status = VideoStatus::Playing;
-        }
-        let _ = refresh_playback(session);
-        drop(inner);
-        self.shared.bump_dirty();
-    }
-
     /// 相对 seek(秒,可负);mpv `seek <delta> relative`。
     pub fn seek_by(&self, delta_secs: f64) {
         if !delta_secs.is_finite() {
@@ -798,6 +824,20 @@ impl VideoCtx {
         }
         drop(inner);
         self.shared.bump_dirty();
+    }
+
+    /// 取「终端写入窗口」：等待转发器到达 sixel 载荷边界后，独占终端。
+    ///
+    /// 与早期实现的区别：**不需要暂停 mpv**（暂停可能停在载荷中间，仍会撕裂，且造成
+    /// 卡顿）。现在由转发器保证：载荷中间持门，dlook 只在边界获得窗口。
+    /// 返回 false = 等待超时，调用方跳过本次写入、下一轮再试。
+    pub fn begin_write(&self) -> bool {
+        self.acquire_tty().is_ok()
+    }
+
+    /// 结束写入窗口（见 `begin_write`）。
+    pub fn end_write(&self) {
+        self.release_tty();
     }
 
     /// 设置显示区域(resize 时调用)。
@@ -932,13 +972,75 @@ impl VideoCtx {
     // -----------------------------------------------------------------------
 
     /// start 的实际实现:测试可注入额外 mpv 参数与 stdout 处理(`--ao=null` / Stdio::null)。
+    /// 取「终端写入窗口」：等待 mpv 转发器处于载荷边界（不在 sixel 载荷中间）。
+    ///
+    /// 为什么需要它：mpv 与 dlook 都写同一个 tty。若 dlook 的字节落在 mpv 一条
+    /// sixel 载荷（DCS `ESC P`..`ESC \\`，实测约 97KB）中间，终端会把它们当载荷数据，
+    /// 直到 mpv 补上终止符——表现为画面撕裂/满屏乱码（独立验收 media-4 B2 与
+    /// pty 场景 S7b 都实测到）。
+    ///
+    /// 早期做法是「暂停 mpv → 写 → 恢复」，但 mpv 可能**停在载荷中间**（暂停命令
+    /// 到达时它已在写一条大载荷），所以那个方案仍会撕裂 —— 且会让播放卡顿。
+    /// 现在改为：mpv 的输出经管道由 dlook 转发，转发器在载荷中间持有本门；dlook 只在
+    /// 门空闲时写自己的 chrome，于是**任何时刻都只有一个写入者、且不在载荷中间**。
+    ///
+    /// 返回 Err 表示超时（等待超过 `GATE_TIMEOUT`）——调用方跳过本次写入、下一轮再试。
+    fn acquire_tty(&self) -> Result<(), ()> {
+        let gate = {
+            let inner = self.shared.lock();
+            match &inner.state {
+                State::Live(session) => session.gate.clone(),
+                _ => return Ok(()), // 无会话：终端只有 dlook 一个写入者
+            }
+        };
+        let Some(gate) = gate else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + GATE_TIMEOUT;
+        let mut held = gate.held.lock().unwrap_or_else(PoisonError::into_inner);
+        while *held {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(());
+            }
+            let (g, timeout) = gate
+                .cv
+                .wait_timeout(held, left)
+                .unwrap_or_else(PoisonError::into_inner);
+            held = g;
+            if timeout.timed_out() && *held {
+                return Err(());
+            }
+        }
+        *held = true;
+        Ok(())
+    }
+
+    /// 释放「终端写入窗口」（见 `acquire_tty`）。
+    fn release_tty(&self) {
+        let gate = {
+            let inner = self.shared.lock();
+            match &inner.state {
+                State::Live(session) => session.gate.clone(),
+                _ => None,
+            }
+        };
+        if let Some(gate) = gate {
+            let mut held = gate.held.lock().unwrap_or_else(PoisonError::into_inner);
+            *held = false;
+            gate.cv.notify_all();
+        }
+    }
+
+    /// `out` = None 表示生产路径：mpv stdout 走管道 + 转发线程（dlook 成为唯一写入者，
+    /// 详见 `spawn_forwarder`）；Some(stdio) 供测试直接指定（如 Stdio::null()）。
     fn start_with(
         &self,
         src: &str,
         area: VideoArea,
         proto: TermProto,
         extra_args: &[&str],
-        out: Stdio,
+        out: Option<Stdio>,
     ) -> Result<(), String> {
         let src = src.trim();
         if src.is_empty() {
@@ -956,13 +1058,28 @@ impl VideoCtx {
         let sock = unique_socket_path();
         let _ = std::fs::remove_file(&sock);
         let (program, args) = build_command(src, area, proto, &sock, extra_args);
+        let forward = out.is_none();
+        let stdout_cfg = out.unwrap_or_else(|| Stdio::piped());
         let mut child = Command::new(program)
             .args(&args)
             .stdin(Stdio::null())
-            .stdout(out)
+            .stdout(stdout_cfg)
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("cannot spawn mpv: {e}"))?;
+
+        // 生产路径：把 mpv 的像素输出接过来转发，并建立写入门
+        let gate = if forward {
+            let pipe = child.stdout.take().ok_or_else(|| {
+                let _ = child.kill();
+                "cannot capture mpv stdout".to_string()
+            })?;
+            let gate = Arc::new(Gate::default());
+            let _fwd = spawn_forwarder(pipe, gate.clone());
+            Some(gate)
+        } else {
+            None
+        };
 
         // 等 socket 就绪(≤5s);期间子进程若退出则直接失败
         let deadline = Instant::now() + SOCKET_WAIT;
@@ -1003,6 +1120,7 @@ impl VideoCtx {
             volume: DEFAULT_VOLUME,
             muted: false,
             volume_before_mute: DEFAULT_VOLUME,
+            gate,
             ipc_failures: 0,
             pending_area: None,
             pending_since: None,
@@ -1077,7 +1195,7 @@ impl VideoCtx {
                 let _ = std::fs::remove_file(&session.sock);
             }
         }
-        let started = self.start_with(&plan.src, plan.area, plan.proto, &[], Stdio::inherit());
+        let started = self.start_with(&plan.src, plan.area, plan.proto, &[], None);
         if started.is_err() {
             self.shared.bump_dirty();
             return;
@@ -1415,7 +1533,7 @@ mod tests {
         area: VideoArea,
         proto: TermProto,
     ) -> Result<(), String> {
-        ctx.start_with(src, area, proto, &["--ao=null"], Stdio::null())
+        ctx.start_with(src, area, proto, &["--ao=null"], Some(Stdio::null()))
     }
 
     fn wait_status(ctx: &VideoCtx, want: &VideoStatus, limit: Duration) -> Option<VideoSnapshot> {

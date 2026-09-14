@@ -15,6 +15,7 @@
 //! 环境变量 `DLOOK_IMAGE_PROTOCOL`:
 //!   - auto(默认):按需探测(文档含图片才查询,纯文本文档零启动开销)
 //!   - halfblocks:跳过探测,强制半块字符(测试/慢终端用)
+//!   - sixel / kitty:跳过探测,强制指定图形协议(自动化测试用;也便于探测不准时手选)
 //!   - off:完全禁用图片,`![alt](src)` 降级为可点击链接
 
 use std::collections::HashMap;
@@ -432,6 +433,18 @@ pub fn acquire_policy(query: bool) -> ImagePolicy {
     match forced.as_str() {
         "off" | "none" | "disable" | "disabled" => ImagePolicy::Off,
         "halfblocks" | "blocks" | "ascii" => ImagePolicy::Picker(Picker::halfblocks()),
+        // 强制指定图形协议:用于自动化测试(在 pty 里验证真实 mpv/sixel 路径而不必依赖
+        // 真实终端的能力应答),也方便用户在探测不准时手动指定。字体尺寸取 Picker 的
+        // 默认值(10x20),几何计算仍按终端格数×该尺寸。
+        "sixel" | "kitty" => {
+            let mut p = Picker::halfblocks();
+            p.set_protocol_type(if forced == "sixel" {
+                ratatui_image::picker::ProtocolType::Sixel
+            } else {
+                ratatui_image::picker::ProtocolType::Kitty
+            });
+            ImagePolicy::Picker(p)
+        }
         _ => {
             // auto:按需探测;探测失败时 from_query_stdio 内部已回退 halfblocks
             if query {

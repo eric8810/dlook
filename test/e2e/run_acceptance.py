@@ -690,6 +690,8 @@ def main():
         # 媒体套件(task media-4)
         "O": scenario_O, "OE9": scenario_O_e9,
         "P": scenario_P, "Q": scenario_Q, "R": scenario_R,
+        # 视频共屏交互（纯 pty：无窗口、无焦点影响；强制 sixel 走真实 mpv 路径）
+        "S": scenario_S,
     }
     # 可选场景过滤:python3 run_acceptance.py A B O R(默认全部)
     want = [a.upper() for a in sys.argv[1:]]
@@ -1591,7 +1593,169 @@ def _xdg_got(log):
     return open(log).read().strip() if os.path.exists(log) else ""
 
 
+# --------------------------------------------------------------------------
+# S. 视频共屏交互（**纯 pty，无窗口/无焦点影响**）
+#
+# 背景：这些断言原先写在 V 视觉套件里，靠 wtype 注入按键——而 Wayland 下 wtype 只能
+# 发给聚焦窗口，于是每次注入都会抢用户焦点（独立反馈），且聚焦瞬间用户正在敲的键会
+# 被截走。协议层面无法「发给非聚焦窗口」，故把交互验证整体搬到 pty：
+#   - 强制 DLOOK_IMAGE_PROTOCOL=sixel → dlook 真的 spawn mpv、真的往 pty 写 sixel 帧
+#   - 按键直接写 pty master（无窗口、无焦点）
+#   - 断言基于**原始字节流**（比截图/OCR 更精确）
+# 视觉保真度仍由 V 套件负责（那个不需要按键）。
+# --------------------------------------------------------------------------
+SIXEL_MARKERS = [b"q quit", b"space", b"\x1b[2J", b"seek "]
+
+
+def sixel_payload_ranges(data):
+    """所有**已终止**的 sixel DCS 载荷区间 [(a, b)]。
+
+    只收已终止的：mpv 被 kill 时（例如 resize 触发会话重启）最后一条载荷可能没有
+    终止符 `ESC \\`。那种截断是 mpv 自身在字节边界被杀造成的，其后的 chrome 字节
+    **不属于**任何完整载荷；若把它们算作载荷内部，会得到「假撕裂」（初版检测器就是
+    这么误报的，见 S7b 的排查记录）。
+    """
+    out = []
+    i = 0
+    while True:
+        a = data.find(b"\x1bP", i)
+        if a < 0:
+            break
+        b = data.find(b"\x1b\\", a)
+        if b < 0:
+            break  # 截断尾部：其后内容不属于任何完整载荷
+        out.append((a, b))
+        i = b + 2
+    return out
+
+
+def sixel_dcs_count(data):
+    return data.count(b"\x1bP")
+
+
+def tearing_hits(data, markers=None):
+    """落在**已终止**载荷内部的 chrome 特征（真撕裂；防御 kill 截断造成的误报）。"""
+    markers = SIXEL_MARKERS if markers is None else markers
+    hits = []
+    for a, b in sixel_payload_ranges(data):
+        payload = data[a:b]
+        hits.extend(m for m in markers if m in payload)
+    return hits
+
+
+def chrome_bytes_outside_payloads(data):
+    """chrome 特征字节里，有多少落在 sixel 载荷**之外**（正常应全部在外）。"""
+    ranges = sixel_payload_ranges(data)
+    n = 0
+    for m in SIXEL_MARKERS:
+        start = 0
+        while True:
+            k = data.find(m, start)
+            if k < 0:
+                break
+            if not any(a <= k < b for a, b in ranges):
+                n += 1
+            start = k + 1
+    return n
+
+
+def scenario_S():
+    print("== S-video-pty (no window, no focus) ==")
+    if shutil.which("mpv") is None:
+        skip("S1–S7 视频共屏 pty 场景", "缺 mpv")
+        return
+    # 本场景要观察「播放中/暂停/恢复」的帧流，素材必须比整个观测窗口长。
+    # clip.mp4 只有 4s（用于降级链场景），播放几秒后就结束，会假失败；
+    # 60s 素材在 experiments/ 下（生成脚本见该项目录 README）。
+    long_clip = os.path.join(ROOT, "docs/research/media/experiments/test-60s.mp4")
+    clip = long_clip if os.path.exists(long_clip) else _video_fixture()
+    if clip is None:
+        skip("S1–S7 视频共屏 pty 场景", "无测试视频素材")
+        return
+    if clip != long_clip:
+        skip("S1–S7 视频共屏 pty 场景", "缺长素材（4s 素材会在观测窗口内播完，结论不可靠）")
+        return
+
+    # 先自检「撕裂检测器」本身有效：构造一个把 chrome 字节插进载荷的流，必须被检出
+    synthetic = b"\x1bPq#0;2;0;0;0" + b"AAAA" + b"q quit" + b"\x1b\\"
+    det = tearing_hits(synthetic)
+    check(bool(det), "S0 撕裂检测器自检（人工构造的载荷内 chrome 能被识别）", str(det))
+    # 反向自检：截断载荷（无终止符）后的 chrome 不得被误判为撕裂
+    truncated = b"\x1bPq#0;2;0;0;0" + b"AA" + b"q quit"  # 无 ESC \\ 终止
+    check(not tearing_hits(truncated),
+          "S0b 检测器不误报截断载荷（mpv 被 kill 的尾部）", str(tearing_hits(truncated)))
+
+    env = dict(os.environ, DLOOK_IMAGE_PROTOCOL="sixel")
+    s = PtySession(BIN + [clip], cols=100, rows=30, env=env, cwd=ROOT)
+    s.start()
+    time.sleep(3.5)
+
+    def raw():
+        return bytes(s.raw)
+
+    # S1 mpv 真的起来了，且按区域参数
+    out = subprocess.run(["pgrep", "-af", "vo-sixel"], capture_output=True, text=True).stdout
+    cmd = next((l for l in out.splitlines() if "vo-sixel-left" in l), "")
+    check(bool(cmd), "S1 mpv 以 sixel 区域参数启动", cmd[:100])
+    check("--vo-sixel-width=" in cmd and "--vo-sixel-height=" in cmd,
+          "S1b mpv 收到像素尺寸（否则画面只有 320×180）", cmd[:140])
+
+    # S2 播放中持续输出 sixel 帧
+    n0 = sixel_dcs_count(raw())
+    time.sleep(2.0)
+    n1 = sixel_dcs_count(raw())
+    check(n1 - n0 >= 10, "S2 播放中 sixel 帧持续输出", f"{n1 - n0} 帧/2s")
+
+    # S3 按 space → 输出停止（暂停真的生效）
+    s.send_key("Space")
+    time.sleep(0.8)
+    n2 = sixel_dcs_count(raw())
+    time.sleep(1.5)
+    n3 = sixel_dcs_count(raw())
+    check(n3 - n2 <= 3, "S3 暂停后帧输出停止（space 生效）", f"{n3 - n2} 帧/1.5s")
+
+    # S4 再按 space → 恢复
+    s.send_key("Space")
+    time.sleep(1.6)
+    n4 = sixel_dcs_count(raw())
+    check(n4 - n3 >= 8, "S4 再按 space 恢复播放", f"{n4 - n3} 帧/1.6s")
+
+    # S5 **chrome 不再冻结**：播放中按键必须有 chrome 写入（且写在载荷之外）
+    before = chrome_bytes_outside_payloads(raw())
+    s.send_key("Right")   # seek → 状态栏消息 + 媒体栏刷新
+    time.sleep(1.2)
+    after = chrome_bytes_outside_payloads(raw())
+    check(after > before, "S5 播放中按键触发 chrome 写入（媒体栏/状态栏未冻结）",
+          f"{before} → {after}")
+
+    # S6 **撕裂不变量**：任何 chrome 字节都不得落在 sixel 载荷内部
+    data = raw()
+    hits = tearing_hits(data)
+    check(not hits, "S6 无撕裂（chrome 字节未混入 sixel 载荷）",
+          f"{len(sixel_payload_ranges(data))} 个完整载荷, 命中={hits}")
+
+    # S7 resize → chrome 恢复（缩小/放大都要重新写 header/footer）
+    s.resize(80, 24)
+    time.sleep(2.0)
+    before_r = chrome_bytes_outside_payloads(raw())
+    s.resize(120, 34)
+    time.sleep(2.5)
+    after_r = chrome_bytes_outside_payloads(raw())
+    check(after_r > before_r, "S7 resize 后 chrome 重新写入（不是永不恢复）",
+          f"{before_r} → {after_r}")
+    data2 = raw()
+    hits2 = tearing_hits(data2)
+    check(not hits2, "S7b resize 路径同样无撕裂",
+          f"{len(sixel_payload_ranges(data2))} 个完整载荷, 命中={hits2}")
+
+    s.send_key("q")
+    code = s.wait_exit(5)
+    s.close()
+    check(code == 0, f"S8 退出码 0 (got {code})")
+
+
 def scenario_Q():
+
     print("== Q-web ==")
     base_url, _reqs, shutdown = _web_server()
     env, xdg_log = _xdg_env("q")
