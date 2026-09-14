@@ -1157,6 +1157,32 @@ fn direct_base() -> &'static Path {
     Path::new("")
 }
 
+/// 直开/回跳场景的引擎来源：相对路径先按 **cwd 绝对化**。
+///
+/// 为什么不能直接传原路径：`media::AudioCtx::open` 内部走链接语义
+/// （`links::normalize(base_dir, src)`），而 `links::normalize` 对空 base 会
+/// **吃掉开头的 `..`**（`Component::ParentDir => out.pop()` 在 out 为空时是空操作）：
+/// `dlook ../audio/tone.wav` 会变成 `audio/tone.wav` → `✗ not found`。
+/// 绝对化后语义唯一（绝对路径不受 base 影响），相对/`../`/带空格路径都正确。
+///
+/// URL（http(s) / file:）由引擎自行解析 → **原样透传**，绝不拼 cwd
+/// （否则 `http://…` 会被拼成 `/cwd/http:/…`，远程音频直接失效）。
+fn direct_src(path: &str) -> String {
+    let p = Path::new(path);
+    if p.is_absolute() || is_url_source(path) {
+        return path.to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(p).to_string_lossy().into_owned(),
+        Err(_) => path.to_string(),
+    }
+}
+
+/// 引擎自解析的来源（远程 URL / file: URL）。
+fn is_url_source(path: &str) -> bool {
+    path.starts_with("http://") || path.starts_with("https://") || path.starts_with("file:")
+}
+
 /// 当前文件所在目录(相对图片/链接按它解析)。
 fn base_dir_of(path: &str) -> PathBuf {
     Path::new(path)
@@ -1213,8 +1239,9 @@ fn event_loop(
     // 媒体模式(D16):进入即启动会话(音频 open / 视频 start / 网页后台 render)。
     match nav.mode {
         Mode::Audio => {
-            // 直开：nav.path 已是 cwd 相对/绝对路径 → 空 base，避免二次拼接（见 direct_base）
-            media.start_audio(&nav.path, direct_base());
+            // 直开：nav.path 已是 cwd 相对/绝对路径 → 绝对化 + 空 base，避免二次拼接
+            // 与 `..` 被吞（见 direct_src / direct_base）
+            media.start_audio(&direct_src(&nav.path), direct_base());
         }
         Mode::Video => {
             let (w, h) = current_size(terminal);
@@ -1551,8 +1578,9 @@ fn retarget_media(
 ) {
     match nav.mode {
         Mode::Audio => {
-            // 直开：nav.path 已是 cwd 相对/绝对路径 → 空 base，避免二次拼接（见 direct_base）
-            media.start_audio(&nav.path, direct_base());
+            // 直开：nav.path 已是 cwd 相对/绝对路径 → 绝对化 + 空 base，避免二次拼接
+            // 与 `..` 被吞（见 direct_src / direct_base）
+            media.start_audio(&direct_src(&nav.path), direct_base());
         }
         Mode::Video => {
             let (w, h) = current_size(terminal);
@@ -2646,6 +2674,65 @@ mod tests {
             links::normalize(direct_base(), "/tmp/tone.wav"),
             Path::new("/tmp/tone.wav")
         );
+    }
+
+    /// 降级链中间层（无 mpv/无协议 → ffmpeg 抽首帧 → 既有图片管线）的真实能力：
+    /// 抽帧产物是可解码的 PNG（消融实验②：删掉这一层后，无 mpv 用户只剩文字信息行）。
+    #[test]
+    fn ffmpeg_first_frame_produces_png_when_available() {
+        if which("ffmpeg").is_none() {
+            eprintln!("SKIP: 本机无 ffmpeg");
+            return;
+        }
+        let clip = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test/fixtures/video/clip.mp4"
+        );
+        if !std::path::Path::new(clip).exists() {
+            eprintln!("SKIP: 缺少测试视频 {clip}");
+            return;
+        }
+        let png = ffmpeg_first_frame(clip).expect("ffmpeg 首帧应成功");
+        let bytes = std::fs::read(&png).expect("首帧文件可读");
+        assert!(bytes.len() > 1000, "首帧 PNG 体积过小: {} 字节", bytes.len());
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "首帧应为 PNG");
+        let _ = std::fs::remove_file(&png);
+    }
+
+    /// 直开来源绝对化：`..` 前缀在链接语义下会被吞掉（normalize 的 ParentDir 对空
+    /// out 是空操作），故相对路径先按 cwd 绝对化（回归：`dlook ../audio/tone.wav`
+    /// 曾报 `✗ not found: ../audio/tone.wav`）。
+    #[test]
+    fn direct_src_absolutizes_relative_paths() {
+        // 空 base 下 `..` 被吞掉 → 这就是必须先绝对化的原因
+        assert_eq!(
+            links::normalize(direct_base(), "../audio/tone.wav"),
+            Path::new("audio/tone.wav")
+        );
+        let abs = direct_src("../audio/tone.wav");
+        assert!(Path::new(&abs).is_absolute(), "{abs}");
+        assert!(abs.contains("/../audio/tone.wav"), "{abs}");
+        // 链接语义会把绝对路径里的 `..` 解析掉（normalize 的 ParentDir）→ 结果等于
+        // cwd 上一级 + audio/tone.wav，语义正确（区别于「被吞掉」的错误形态）
+        let cwd = std::env::current_dir().unwrap();
+        let want = cwd.parent().unwrap().join("audio/tone.wav");
+        assert_eq!(links::normalize(direct_base(), &abs), want);
+        // 绝对路径 / URL 原样透传（URL 拼 cwd 会直接毁掉远程音频）
+        assert_eq!(direct_src("/tmp/tone.wav"), "/tmp/tone.wav");
+        assert_eq!(direct_src("file:///tmp/tone.wav"), "file:///tmp/tone.wav");
+        assert_eq!(
+            direct_src("http://127.0.0.1:8080/tone.wav"),
+            "http://127.0.0.1:8080/tone.wav"
+        );
+        assert_eq!(
+            direct_src("https://example.com/a.mp3"),
+            "https://example.com/a.mp3"
+        );
+        assert!(is_url_source("file:relative.wav"));
+        assert!(!is_url_source("audio/tone.wav"));
+        // 普通相对路径 → cwd 拼接
+        let rel = direct_src("test/fixtures/audio/tone.wav");
+        assert!(rel.ends_with("/test/fixtures/audio/tone.wav"), "{rel}");
     }
 
     #[test]

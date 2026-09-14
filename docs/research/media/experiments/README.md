@@ -259,7 +259,7 @@ $ mpv --vo=kitty --list-options | grep -cE -- '--vo-kitty-(left|top|cols|rows|wi
 `mpv --pause --frames=1` 渲染一帧），diff 出画面实际占据的设备像素矩形：
 
 ```
-  six-nolimit       (348, 1905, 0, 67)     ← 含光标列伪影，见下
+  six-nolimit       (1494, 893, 28, 0)     ← 画面之外含窗口重排/shell 伪影，见下
   six-lt1-1         (320, 180, 28, 28)
   six-lt6-4         (320, 180, 118, 145)
   six-lt12-9        (320, 180, 226, 340)
@@ -267,12 +267,16 @@ $ mpv --vo=kitty --list-options | grep -cE -- '--vo-kitty-(left|top|cols|rows|wi
   kit-in-foot       None（无变化：foot 无 kitty 协议，kitty VO 不输出画面）
 ```
 
+（`nolimit` 行的宽高在两次运行间不同——348×1905 与 1494×893——因为该变体的画面按窗口
+自动居中/铺满，diff 里混入了窗口自身重排的像素；有显式参数的 `lt*/wh*` 行稳定可复现，
+结论只用这些行。）
+
 - **left/top 在真实终端里线性生效**：列差 (118-28)/5 = (226-118)/6 = **18 设备px/格**
   （scale 2 → 9 逻辑px/格）；行差 (145-28)/3 = (340-145)/5 = **39 设备px/行**（19.5 逻辑px/行）。
 - **width/height 生效**：请求 200×100 → 屏上画面 170×96 设备px，与 pty 段的 raster 完全一致
   （sixel 在 foot 里 1:1 映射到设备像素）。
-- `nolimit` 行的 1905px 高是**窗口底部 shell 睡醒/滚动**造成的伪影（bare diff 会把非 mpv
-  变化一起算进去）；该行的结论只用「原点单调右/下移」这一条，尺寸以 `lt*/wh*` 变体为准。
+- `nolimit` 行混入了**窗口自身重排**的像素（mpv 在无显式区域时按窗口自动居中/铺满），
+  该行只用「原点与显式参数不同」这一条，尺寸结论只取 `lt*/wh*` 变体。
 - 已知边界：本机多显示器混合 scale（eDP-1 scale 2 / DP-1 scale 1.6），窗口偶发被重排导致
   截图几何漂移；脚本内做了**同窗口 before/after + 几何不一致重试**来消除该噪声。
 
@@ -299,3 +303,21 @@ $ mpv --vo=kitty --list-options | grep -cE -- '--vo-kitty-(left|top|cols|rows|wi
 拿到终端像素尺寸（pty 下拿不到、退回 320×240；foot 下 width/height 显式给出时 1:1 生效）；
 若要求像素级精确，集成层应用 picker 的字体格尺寸换算后同时传 `width/height`（接口扩展，
 交主 agent 裁决）。
+
+**E14 附:seek 精度(控制链验证的副产品,决定 video.rs 固定参数)**
+在真实 IPC 会话里发现 mpv 默认 `--hr-seek=default` **把相对/百分比 seek 吸附到关键帧**——
+3s 测试素材(ffmpeg 默认 GOP,基本只有一个关键帧)上的表现:
+
+```
+（默认 hr-seek）
+  paused: seek 0.5 absolute        -> pos 0.5      ✓ 精确
+  paused: seek -0.3 relative       -> pos 0.0      ✗ 吸附到关键帧(期望 0.2)
+  paused: seek 25 absolute-percent -> pos 0.0      ✗ 期望 0.767
+（加 --hr-seek=yes）
+  paused: seek 0.5 absolute        -> pos 0.5      ✓
+  paused: seek -0.3 relative       -> pos 0.2      ✓
+  paused: seek 25 absolute-percent -> pos 0.767    ✓
+```
+
+→ click-to-seek / scrubbing(design §3)要求精确落点,故 video.rs 的固定参数里加
+`--hr-seek=yes`;否则长片上的相对 seek 会跳到最近关键帧,进度条与画面不同步。

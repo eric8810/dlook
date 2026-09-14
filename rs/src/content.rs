@@ -32,12 +32,36 @@ fn fail(msg: &str) -> ! {
     exit(1);
 }
 
+/// 由引擎（而非 content）解析的来源：远程 URL + 音频/视频的 `file:` URL。
+///
+/// `file:` URL 只对「引擎自己能把 URL 还原成路径」的模式放行：音频（media.rs 的
+/// `prepare_source`）与视频（mpv 原生接受 file:// URL）。图片/网页保持原来的
+/// 本地路径校验语义，不改既有行为。
+fn is_engine_url(mode: Mode, arg: &str) -> bool {
+    if arg.starts_with("http://") || arg.starts_with("https://") {
+        return true;
+    }
+    arg.starts_with("file:") && matches!(mode, Mode::Audio | Mode::Video)
+}
+
 pub fn load_content(file_path: &str) -> Loaded {
     let (mode, syntax_token) = detect_mode_lang(file_path);
 
     // 远程 URL(D16):无本地文件,字节由 web::render / AudioCtx(下载)/ ImageCtx(fetch)
     // 各自获取;此处不做任何文件系统访问。
     if file_path.starts_with("http://") || file_path.starts_with("https://") {
+        return Loaded {
+            file_name: file_path.to_string(),
+            content: String::new(),
+            mode,
+            syntax_token,
+        };
+    }
+
+    // 媒体的 file: URL（file:///abs、file://abs）:与 http(s) 同理由引擎处理
+    // （media.rs::prepare_source 把 file: URL 还原为绝对路径），此处不做文件系统访问，
+    // 否则 CLI 直开 `dlook file:///.../tone.wav` 会在入口就被判「文件不存在」。
+    if is_engine_url(mode, file_path) {
         return Loaded {
             file_name: file_path.to_string(),
             content: String::new(),
@@ -126,4 +150,24 @@ pub fn read_for_navigate(path: &Path) -> Result<String, OpenError> {
         return Err(OpenError::Binary);
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 引擎自解析的来源:http(s) 与音频/视频的 file: URL 不做本地文件系统校验
+    /// (否则 CLI 直开 `dlook file:///.../tone.wav` 在入口即报 not found)。
+    #[test]
+    fn engine_urls_skip_local_fs_check() {
+        assert!(is_engine_url(Mode::Web, "https://example.com/a.html"));
+        assert!(is_engine_url(Mode::Audio, "http://127.0.0.1:1/tone.wav"));
+        assert!(is_engine_url(Mode::Audio, "file:///tmp/tone.wav"));
+        assert!(is_engine_url(Mode::Video, "file:///tmp/clip.mp4"));
+        // 图片/网页的 file: URL 不享受该放行(保持既有本地路径校验语义)
+        assert!(!is_engine_url(Mode::Image, "file:///tmp/tiny.png"));
+        assert!(!is_engine_url(Mode::Image, "file:///tmp/page.html"));
+        // 普通路径照旧
+        assert!(!is_engine_url(Mode::Audio, "audio/tone.wav"));
+    }
 }
