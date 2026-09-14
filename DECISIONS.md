@@ -23,6 +23,7 @@
 | D13 | 项目名/仓库名 | 统一改为 dlook(含 GitHub repo 重命名) | S | ✅ 已实施 |
 | D14 | 本地文件链接点击跳转 | A:内容坐标 LinkSpan + 应用内导航栈;外部链接交系统打开器 | M | ✅ 已实施 |
 | D15 | 图片渲染(翻案 D9) | 终端图形协议(kitty/sixel/iTerm2+halfblocks 回退)+ 直开图片文件 | L | ✅ 已实施 |
+| D16 | 媒体能力(音频/视频/网页) | 音频原生 rodio；视频委托 mpv + 唯一写入者架构；网页 L1 文本 + L3 浏览器 | L | ✅ 已实施 |
 
 ---
 
@@ -269,3 +270,40 @@ notify → stat 轮询热重载(行为等价,事件循环本就以 200ms 轮询,
 | D12 | 保持全功能 6.59MB(−91KB);UPX 实测可行(2.57MB)但用户否决;mermaid 链 3.47MB 不可内裁,1–2MB 目标放弃;采纳 notify→stat 轮询热重载(行为等价,去 watcher 线程与依赖) | 2026-09-03 | 体积构成见 D12 小节;验证 15+96+33+热重载冒烟全过 |
 | D14 | 本地文件链接应用内点击跳转:内容坐标 `LinkSpan`(links.rs)+ Nav 历史栈(⌫/Alt+← 返回,恢复滚动);本地链接 ↗ 标记(语法粗分),点击期校验(缺失/目录/二进制 → 状态栏);外部链接 xdg-open/open/start(spawn 不等待,非阻塞收割);`%XX` + `<空格路径>` 支持;顺带修复纯点击视口首/末行被 edge_autoscroll 平移的缺陷 | 2026-09-12 | 详见 D14 小节;markdown.rs 管线改为先 frame_tables 后 style_links(链接行号基于最终行集);验证 25+115+33 全过;E2E M1–M8 |
 | D15 | 图片渲染(翻案 D9):ratatui-image 11 协议探测(kitty/sixel/iTerm2 → halfblocks 回退)+ `Doc.images` 占位行集成(sliced 滚动部分可见)+ `ImageCtx` 后台加载注册表(本地/http(s)/data:,dirty 计数重排)+ md 独立段落图片/行内降级链接 + 直开图片文件(Mode::Image)+ `DLOOK_IMAGE_PROTOCOL` 环境变量 | 2026-09-13 | 详见 D15 小节;体积 6.59→9.21MB(+2.62MB);验证 40+138+40 全过;E2E N1–N8、tmux T30–T36 |
+
+## D16 媒体能力：音频 / 视频 / 网页（2026-09-14 追加）
+
+**背景**：用户需求——markdown 文档里能听音乐、看视频，以及网页预览。研究见
+[docs/research/media/](docs/research/media/)，设计与任务见 [docs/design/media.md](docs/design/media.md)、
+[docs/plan/analysis/media-mvp.md](docs/plan/analysis/media-mvp.md)。
+
+**方案与实现**：
+
+| 能力 | 做法 | 边界 |
+|---|---|---|
+| 音频 | rodio 0.22（薄封装在 [media.rs](rs/src/media.rs)）+ symphonia 解码；M1 直开、M2 文档内点链接就地播放 | flac/mp3/m4a/vorbis/wav；**无 opus**（上游未发布纯 Rust 解码器）；Linux 需 `libasound.so.2`（链接依赖） |
+| 视频 | 委托 mpv（官方 `--vo=kitty`/`--vo=sixel`）+ JSON IPC 控制；[video.rs](rs/src/video.rs) 为唯一接触面 | 需系统装 mpv；像素级播放需终端支持 kitty 或 sixel |
+| 网页 | L1 文本渲染（ureq + html2text 类型化注解 → 行模型）；L3 交系统浏览器 | 无 JS；**不拉取任何子资源**（防追踪像素） |
+
+**关键设计决定（视频共屏）**：dlook 与 mpv 会同时写同一个终端，字节交叉即乱码。
+最终做法是 **dlook 成为唯一写入者**：mpv 输出走管道，转发线程识别帧边界
+（sixel = 一个 DCS；kitty = 若干 APC 块直到 `m=0`），帧内持门、帧末让路；
+dlook 的界面写入只在帧边界进行，并有 **UI 优先级**（转发器见有人在等就让路，
+避免慢终端/SSH 下界面饿死）。
+
+**被推翻的中间方案**（记录以免重走）：①仅按生命周期相位清屏——不够，diff 写入同样插进载荷；
+②播放期完全不写终端——可用性坏掉（时间码冻结、按键无反馈、resize 不恢复）；
+③暂停 mpv 再写——暂停可能停在载荷中间（一条载荷约 97KB），仍会撕裂。
+
+**验证**：单元 124 项；pty 场景 S（两种协议各 13 项，含撕裂不变量、播放/暂停/恢复、
+resize 恢复、mpv 参数与像素尺寸）——**反事实验证过**（把帧识别改回错误做法立刻变红）。
+另有音频探针（null sink + ffmpeg pulse + 静音基线对照，证明样本真的到达设备）、
+网页安全 canary（断言不请求子资源）。
+
+**已知边界**：Kitty/Ghostty 等用 kitty 协议的终端，协议层正确性已在 pty 中验证，
+但**真实窗口的观感未经人眼确认**；视频帧率取决于终端解析能力；媒体会话不参与热重载。
+
+**体积**：0.4.0 的 9.21MB → 本地 release 构建见发版记录（rodio+symphonia 约 +1.5MB，
+html2text 与既有依赖复用）。
+
+---

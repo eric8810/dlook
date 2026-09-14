@@ -4,7 +4,7 @@
 
 # dlook
 
-**Markdown · Code · Mermaid — beautifully rendered in your terminal.**
+**Markdown · Code · Mermaid · Image · Audio · Video · Web — rendered in your terminal.**
 
 [![release](https://img.shields.io/github/v/release/eric8810/dlook?color=brightgreen&label=release)](https://github.com/eric8810/dlook/releases)
 [![license](https://img.shields.io/github/license/eric8810/dlook?color=blue)](LICENSE)
@@ -32,6 +32,9 @@ screenshot is binary noise in your terminal.
 | | dlook |
 |---|---|
 | 🎨 **Markdown** | colored headings (h1/h2 cyan, h3/h4 blue), task lists `☑/☐`, rounded tables, styled links, quotes, strikethrough |
+| 🎵 **Audio** | play in place from a document, or directly (`dlook song.mp3`) — media bar with progress, `p` play/pause, `←→` seek, `-`/`+` volume |
+| 🎬 **Video** | in-terminal playback via **mpv** (kitty / sixel graphics); media bar and key handling stay with dlook. Requires `mpv` installed |
+| 🌐 **Web** | `dlook https://…` or a local `.html` renders as readable text with clickable links; **no subresources are fetched** |
 | 🖼️ **Images** | in-markdown & standalone image viewing — **kitty / sixel / iTerm2 graphics protocols** with halfblocks truecolor fallback; local, `http(s)` and `data:` sources |
 | 🖍️ **Code** | token-level **24-bit truecolor** highlighting — 40+ languages incl. TypeScript, Vue, Svelte, TOML, GraphQL, Dockerfile, PowerShell |
 | 📈 **Mermaid** | 28 diagram types rendered to **truecolor ASCII art** — no browser, no node |
