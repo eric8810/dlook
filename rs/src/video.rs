@@ -36,6 +36,7 @@
 
 use std::ffi::OsString;
 use std::io::{ErrorKind, Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -531,6 +532,11 @@ fn parse_json(text: &str) -> Option<Json> {
 // ---------------------------------------------------------------------------
 
 /// mpv IPC 连接:发送 `{"command":[…],"request_id":n}` 行,按 request_id 取回响应。
+///
+/// `cfg(unix)`：dlook 的视频会话基于 Unix domain socket（mpv `--input-ipc-server`）。
+/// Windows 上 mpv 用命名管道，dlook 尚未实现 → 整个会话层不参与编译，`VideoCtx`
+/// 走不可用分支（集成层降级为静帧/信息行）。
+#[cfg(unix)]
 struct Ipc {
     stream: UnixStream,
     /// 未消费的原始字节(跨调用保留;超时不丢半行)。
@@ -538,6 +544,7 @@ struct Ipc {
     next_id: u64,
 }
 
+#[cfg(unix)]
 impl Ipc {
     fn connect(path: &Path) -> std::io::Result<Ipc> {
         let stream = UnixStream::connect(path)?;
@@ -786,6 +793,12 @@ impl VideoCtx {
     }
 
     /// mpv 是否可用(缓存探测:PATH 中能找到 mpv 且可执行)。
+    #[cfg(not(unix))]
+    pub fn available() -> bool {
+        false // Windows：视频会话未实现 → 集成层走降级链（首帧静图/信息行）
+    }
+
+    #[cfg(unix)]
     pub fn available() -> bool {
         static CACHE: OnceLock<bool> = OnceLock::new();
         *CACHE.get_or_init(|| probe_mpv(None))
@@ -1182,6 +1195,19 @@ impl VideoCtx {
 
     /// `out` = None 表示生产路径：mpv stdout 走管道 + 转发线程（dlook 成为唯一写入者，
     /// 详见 `spawn_forwarder`）；Some(stdio) 供测试直接指定（如 Stdio::null()）。
+    #[cfg(not(unix))]
+    fn start_with(
+        &self,
+        _src: &str,
+        _area: VideoArea,
+        _proto: TermProto,
+        _extra_args: &[&str],
+        _out: Option<Stdio>,
+    ) -> Result<(), String> {
+        Err("video session is not implemented on this platform".into())
+    }
+
+    #[cfg(unix)]
     fn start_with(
         &self,
         src: &str,
@@ -1510,6 +1536,7 @@ fn wait_or_kill(child: Option<&mut Child>, limit: Duration) {
 
 /// 可读的退出原因(信号/退出码;`--really-quiet` 下 mpv 不打 stderr,只能合成)。
 fn exit_reason(status: ExitStatus, src: &str) -> String {
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     if let Some(sig) = status.signal() {
         return format!("mpv killed by signal {sig} ({src})");

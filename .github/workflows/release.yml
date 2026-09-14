@@ -37,6 +37,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Linux 音频（cpal/rodio）需要 ALSA 开发库：cpal 在 Linux 上链接 libasound，
+      # 缺 pkg-config + libasound2-dev 会直接构建失败（v0.5.0 首次发版即如此）。
+      # macOS/Windows 用系统音频 API，无需额外依赖。
+      - name: Install ALSA dev libraries (Linux)
+        if: matrix.os == 'ubuntu-22.04'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rs
