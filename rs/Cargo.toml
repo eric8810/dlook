@@ -31,6 +31,7 @@ base64-simd = "0.8"
 rodio = "0.22"
 # 网页文本渲染(D16 L1):html2text 类型化注解(Link/Strong/Code/Image)→ dlook 行模型
 html2text = "0.17"
+terminal-light = "1.9"
 
 [profile.release]
 opt-level = "z"

@@ -37,7 +37,7 @@ screenshot is binary noise in your terminal.
 | 🌐 **Web** | `dlook https://…` or a local `.html` renders as readable text with clickable links; **no subresources are fetched** |
 | 🖼️ **Images** | in-markdown & standalone image viewing — **kitty / sixel / iTerm2 graphics protocols** with halfblocks truecolor fallback; local, `http(s)` and `data:` sources |
 | 🖍️ **Code** | token-level **24-bit truecolor** highlighting — 40+ languages incl. TypeScript, Vue, Svelte, TOML, GraphQL, Dockerfile, PowerShell |
-| 📈 **Mermaid** | 28 diagram types rendered to **truecolor ASCII art** — no browser, no node |
+| 📈 **Mermaid** | 28 diagram types rendered to **truecolor ASCII art** — no browser, no node; palette follows your terminal background (dark/light, auto-detected) and echoes the body text colors |
 | 🖱️ **Selection** | drag to select (reversed highlight, edge auto-scroll), release to copy via **OSC 52** — works over SSH |
 | 🔥 **Live reload** | watches the file and re-renders on every save |
 | 📦 **Tiny & static** | ~9.2 MB binary, zero runtime, instant startup |

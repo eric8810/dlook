@@ -307,3 +307,41 @@ resize 恢复、mpv 参数与像素尺寸）——**反事实验证过**（把�
 html2text 与既有依赖复用）。
 
 ---
+
+## D17 mermaid 配色与正文同源设计（2026-09-16 追加）
+
+**背景**：用户反馈——mermaid 图的渲染颜色与字符颜色在暗色终端不可读。
+根因（mermansi 0.1.6，上游最新且未暴露主题 API）：
+
+- 矩形 flowchart / sequence / state / xychart 走 merman-ascii，**固定 light 主题**
+  （文字 `#27272a` 近黑、连线 `#71717a`、箭头 `#52525b`）——暗底上几乎不可见；
+- 形状节点 flowchart / class / pie / mindmap / journey 走 mermansi fallback，
+  **完全无色**（默认前景，可读但无层次）。
+
+**方案**（mermansi 输出确定性 SGR 常量集合 → dlook 侧查表重映射/补色，
+实现见 [mermaid.rs](rs/src/mermaid.rs)）：
+
+| 角色 | dark（默认） | light | 与正文的同源关系 |
+|---|---|---|---|
+| 节点/边文字、标题 | 默认前景（SGR 39） | 默认前景 | 同正文文字色，随终端主题自适应 |
+| 边框/分组/框架 | 青 `#22d3ee` | `#0891b2` | 同 h1/h2 青色系 |
+| 连线/生命线/坐标轴/激活条 | 蓝 `#60a5fa` | `#2563eb` | 同链接蓝色系 |
+| 箭头 | 琥珀 `#ffc457` | `#b45309` | 点缀色（沿用 mermansi AnsiRole 箭头色） |
+| 图表系列 | 400 系亮色 | 上游 600 系 | truecolor 多系列区分 |
+
+主题选择：启动期 terminal-light（OSC 11 查询，20ms 超时；失败回退 `COLORFGBG`；
+再失败默认暗色，同 D4 立场）。**仅 mermaid 文档**（`.mmd` 或含 mermaid 围栏的 md）
+才查询，其余文档保持即时启动；查询在进 raw mode 前完成。无色 fallback 输出按
+盒绘/箭头字符启发式补色（文字不染色）。
+
+**已知边界**：重映射按键值精确匹配，若用户在 mermaid 源里手写恰好等于上游
+light 主题常量的颜色会被一并改写（概率极低，且结果仍可读）；mermansi 升级后
+若改变常量集合，映射自然失效退化为原样输出（不致错）；热重载后新增 mermaid
+围栏的文档沿用启动期的主题结论。
+
+**验证**：单元 8 项新增（重映射 dark/light、未知序列透传、无色补色、fallback
+形状节点端到端）共 133 过；pty 实渲染 6 图型确认暗色调色板落地、旧 light 色值
+零残留；`COLORFGBG=0;15` 确认 light 调色板与暗色零串漏；pyte 屏幕快照确认补色
+不改版面。**体积**：+terminal-light/xterm-query/nix，11.04 → 11.05MB（约 +10KB）。
+
+---

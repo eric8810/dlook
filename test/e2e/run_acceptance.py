@@ -337,6 +337,28 @@ def scenario_I():
     check("flowchart TD" not in txt, "I2 .mmd source not shown as text")
     s.send_key("q"); s.wait_exit(3); s.close()
 
+    # I5 mermaid 配色随暗色终端(DECISIONS D17):pty 无 OSC 11 响应 + 清空
+    # COLORFGBG → 默认暗色调色板;结构=青 #22d3ee,文字=默认前景,旧 light 近黑
+    # 文字色(#27272a)不得残留
+    s = session("sample.mmd", env=dict(os.environ, COLORFGBG=""))
+    s.feed(0.8)
+    raw = s.raw_text()
+    check("\x1b[38;2;34;211;238" in raw, "I5 dark palette structure color present",
+          "cyan #22d3ee missing")
+    check("\x1b[38;2;39;39;42" not in raw, "I5 legacy light text color gone",
+          "near-black #27272a still present")
+    s.send_key("q"); s.wait_exit(3); s.close()
+
+    # I6 COLORFGBG 报告浅色背景 → light 调色板(青 #0891b2),暗色板零串漏
+    s = session("sample.mmd", env=dict(os.environ, COLORFGBG="0;15"))
+    s.feed(0.8)
+    raw = s.raw_text()
+    check("\x1b[38;2;8;145;178" in raw, "I6 light palette structure color present",
+          "cyan-600 #0891b2 missing")
+    check("\x1b[38;2;34;211;238" not in raw, "I6 dark palette not leaked",
+          "dark cyan #22d3ee leaked into light")
+    s.send_key("q"); s.wait_exit(3); s.close()
+
     # I3 markdown 内代码块上色（truecolor）
     s = session("codeblock.md")
     check(s.wait_for("Code Block", 6), "I3 start")

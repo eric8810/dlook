@@ -1096,6 +1096,12 @@ fn still_src_key(path: &Path) -> String {
     format!("file:{}?v0", path.display())
 }
 
+/// markdown 源里是否有 mermaid 代码围栏（```mermaid / ~~~mermaid）。
+/// 决定是否做终端背景检测（见 run 中 D17 注释）。
+fn has_mermaid_fence(md: &str) -> bool {
+    md.contains("```mermaid") || md.contains("~~~mermaid")
+}
+
 /// 构建 markdown skin(对齐 vue-tui 默认主题,见 GAP.md G1/G2/G6):
 ///   - 标题:粗体(去 termimad 默认下划线);h1/h2 青、h3/h4 蓝、h5/h6 无色
 ///   - H1 左对齐(termimad 默认居中,vue-tui 为左对齐)
@@ -1145,6 +1151,15 @@ pub fn run(
     // 视频模式(D16)需要协议结论来选 mpv 的 vo → 一并探测。
     let query_proto = images::should_query_protocol(mode, initial_content) || mode == Mode::Video;
     let img_ctx = ImageCtx::new(images::acquire_policy(query_proto));
+
+    // mermaid 配色主题检测（DECISIONS D17）：terminal-light 查 OSC 11，
+    // 失败回退 COLORFGBG（Windows 无查询则直接默认暗色）。须在进入 raw mode
+    // 之前调用（terminal-light 自管临时 raw mode 收响应）；仅 mermaid 文档
+    // 查询，其余文档保持即时启动。热重载后新增 mermaid 块的文档沿用启动期结论。
+    if mode == Mode::Mermaid || has_mermaid_fence(initial_content) {
+        let dark = terminal_light::luma().map_or(true, |l| l <= 0.6);
+        mermaid::set_dark_bg(dark);
+    }
 
     let _ = enable_raw_mode();
 
